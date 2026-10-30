@@ -1,0 +1,25 @@
+# Entornos virtuales y caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Datos e índices generados por LightRAG, E2GraphRAG y Graphiti
+workdir_*/
+lightrag_cache/
+e2graphrag_cache/
+graphiti_cache/
+*.db
+*.sqlite3
+*.graphml
+
+# Caché de modelos locales (HuggingFace / vLLM)
+hf_cache/
+models/
+vllm_server.log
+
+# Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
+.ipynb_checkpoints/
+.DS_Store
