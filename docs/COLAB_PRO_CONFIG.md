@@ -1,4 +1,7 @@
-# Guía de Configuración Máxima en Google Colab Pro / Google AI Pro
+# Documentación Interna: Guía de Configuración en Google Colab Pro / Google AI Pro
+
+> [!NOTE]
+> **Documentación Técnica Interna**: Guía operativa para el equipo de desarrollo/investigación. Detalla la asignación de hardware, partición de VRAM y flujo de ejecución en Google Colab para reproducir los experimentos del PFC.
 
 Dado que cuentas con una suscripción **Google AI Pro / Google Colab Pro**, esta guía detalla cómo exprimir al máximo el hardware disponible (**NVIDIA A100-SXM4-40GB/80GB** o **NVIDIA L4-24GB** con **High-RAM**) para ejecutar los experimentos del Trabajo de Fin de Carrera con **$0 de costo en APIs externas**.
 
@@ -6,7 +9,7 @@ Dado que cuentas con una suscripción **Google AI Pro / Google Colab Pro**, esta
 
 ## 1. Selección del Entorno de Ejecución (Runtime)
 
-1. Abre el notebook [`notebooks/PFC_Experimentos_RAG_Colab.ipynb`](notebooks/PFC_Experimentos_RAG_Colab.ipynb) en Google Colab.
+1. Abre el notebook [`../notebooks/PFC_Experimentos_RAG_Colab.ipynb`](../notebooks/PFC_Experimentos_RAG_Colab.ipynb) en Google Colab.
 2. En el menú superior, navega a:
    **Entorno de ejecución (Runtime) $\rightarrow$ Cambiar tipo de entorno de ejecución (Change runtime type)**.
 3. Configura los siguientes parámetros al máximo nivel:
@@ -46,7 +49,7 @@ En nuestros experimentos coexisten en la misma GPU el servidor **vLLM** (inferen
 | **Embeddings (`BAAI/bge-m3`)** | GPU `cuda:0` en `float16` (`batch_size=128`) | GPU `cuda:0` en `float16` (`batch_size=32`) |
 | **SpaCy NER + Coocurrencia (E2GraphRAG)** | CPU Multiproceso (`n_process=8`, usa ~12 GB de los 83 GB de RAM) | CPU Multiproceso (`n_process=4`) |
 
-El módulo [`src/config.py`](src/config.py) detecta automáticamente si estás corriendo sobre una **A100** o una **L4** mediante `torch.cuda.get_device_name(0)` y ajusta estos parámetros sin intervención manual.
+El módulo [`../src/config.py`](../src/config.py) detecta automáticamente si estás corriendo sobre una **A100** o una **L4** mediante `torch.cuda.get_device_name(0)` y ajusta estos parámetros sin intervención manual.
 
 ---
 

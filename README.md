@@ -22,7 +22,8 @@ Diseñado para ejecutarse con **$0 de costo en APIs** en **Google Colab Pro / Go
 
 ```text
 pfc1/
-├── COLAB_PRO_CONFIG.md                  # Guía de configuración máxima en Google Colab Pro (A100/L4 + High-RAM)
+├── docs/
+│   └── COLAB_PRO_CONFIG.md              # Documentación interna: Guía de configuración en Google Colab Pro (A100/L4 + High-RAM)
 ├── README.md                            # Documentación principal y arquitectura del repositorio
 ├── requirements.txt                     # Dependencias Python 3.10+
 ├── notebooks/
@@ -51,6 +52,7 @@ El repositorio está organizado siguiendo un flujo Git modular por componente ex
 
 ---
 
-## 4. Inicio Rápido en Google Colab Pro
+## 4. Documentación Interna y Ejecución en Google Colab Pro
 
-Consulta [`COLAB_PRO_CONFIG.md`](COLAB_PRO_CONFIG.md) para los detalles de configuración de hardware **A100 + High-RAM** y abre directamente [`notebooks/PFC_Experimentos_RAG_Colab.ipynb`](notebooks/PFC_Experimentos_RAG_Colab.ipynb).
+Consulta la documentación técnica interna en [`docs/COLAB_PRO_CONFIG.md`](docs/COLAB_PRO_CONFIG.md) para los detalles de configuración de hardware **A100 + High-RAM**, asignación de VRAM y persistencia de datos. Puedes abrir directamente el cuaderno de experimentación en [`notebooks/PFC_Experimentos_RAG_Colab.ipynb`](notebooks/PFC_Experimentos_RAG_Colab.ipynb).
+
