@@ -7,6 +7,7 @@ y ajusta los hiperparámetros de vLLM, concurrencia y procesamiento multiproceso
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
@@ -59,6 +60,29 @@ class ExperimentConfig:
     exp2_csv_path: str = "experimento2_resultados.csv"
     fig1_path: str = "fig1_latencia_indexacion.png"
     fig2_path: str = "fig2_bitemporal_recall_errores.png"
+    google_drive_dir: Path = Path("/content/drive/MyDrive/PFC_RAG_Resultados")
+
+    def sync_to_google_drive(self, local_file: str | Path) -> bool:
+        """
+        Sincroniza un archivo generado localmente a Google Drive si Drive está montado.
+        Crea la carpeta de destino automáticamente.
+        """
+        try:
+            p = Path(local_file)
+            if not p.is_absolute():
+                p = (self.base_dir / p).resolve()
+            if not p.exists():
+                return False
+            drive_root = Path("/content/drive/MyDrive")
+            if drive_root.exists():
+                self.google_drive_dir.mkdir(parents=True, exist_ok=True)
+                dest = self.google_drive_dir / p.name
+                shutil.copy2(p, dest)
+                print(f"[DRIVE] Sincronizado automáticamente a Drive: {dest}")
+                return True
+        except Exception as exc:
+            print(f"[DRIVE ADVERTENCIA] No se pudo sincronizar a Drive: {exc}")
+        return False
 
     @property
     def base_url(self) -> str:

@@ -508,6 +508,10 @@ async def run_experiment_1(
     print(f"[EXP 1] Perfil de Hardware detectado: {hw_profile}")
 
     inf_engine = engine or LocalInferenceEngine(cfg)
+    if not inf_engine.is_server_healthy():
+        print("[INFO] Servidor vLLM no detectado activo. Iniciando automáticamente...")
+        inf_engine.start_vllm_server(timeout_seconds=300)
+
     partitions = load_longmemeval_partitions(
         token_targets=cfg.exp1_token_partitions,
         token_counter=inf_engine.count_tokens,
@@ -558,9 +562,11 @@ async def run_experiment_1(
         # Guardado incremental tras cada partición para resiliencia en Colab
         df_partial = pd.DataFrame(results)
         df_partial.to_csv(csv_out_path, index=False, encoding="utf-8")
+        cfg.sync_to_google_drive(csv_out_path)
 
     df_final = pd.DataFrame(results)
     df_final.to_csv(csv_out_path, index=False, encoding="utf-8")
+    cfg.sync_to_google_drive(csv_out_path)
     print(
         f"\n[OK] Resultados del Experimento 1 exportados a: {csv_out_path.resolve()}"
     )

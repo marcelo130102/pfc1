@@ -302,6 +302,10 @@ def generate_all_figures(
         csv_path=cfg.base_dir / cfg.exp2_csv_path,
         output_path=cfg.base_dir / cfg.fig2_path,
     )
+    cfg.sync_to_google_drive(f1)
+    cfg.sync_to_google_drive(f1.with_suffix(".pdf"))
+    cfg.sync_to_google_drive(f2)
+    cfg.sync_to_google_drive(f2.with_suffix(".pdf"))
     return f1, f2
 
 

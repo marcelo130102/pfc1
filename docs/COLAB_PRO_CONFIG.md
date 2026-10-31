@@ -93,3 +93,46 @@ Puedes clonar y cambiar entre las ramas del repositorio directamente desde una c
 !python -m src.exp2_bitemporal
 !python -m src.visualization
 ```
+
+---
+
+## 7. Ejecución Desatendida / Asíncrona en Google Colab Pro
+
+Dado que el Experimento 1 (hasta 1M tokens) y el Experimento 2 (evaluación con Juez LLM) toman varias horas de cómputo intensivo, **no es necesario que mantengas tu navegador abierto ni tu Mac encendida**. 
+
+Google Colab Pro incluye **Ejecución en segundo plano (Background Execution)** que mantiene la máquina virtual corriendo hasta **24 horas continuas**.
+
+### Método A: Ejecución Total desde el Notebook (Recomendado)
+
+1. **Montar Google Drive**: Ejecuta la celda inicial de persistencia (`drive.mount('/content/drive')`). Autoriza el acceso en la ventana emergente.
+2. **Lanzar todo el flujo**: En el menú superior de Colab, selecciona:
+   **Entorno de ejecución $\rightarrow$ Ejecutar todas** (o atajo `Cmd + F9` en Mac / `Ctrl + F9` en Windows).
+3. **Cerrar el navegador**: Puedes cerrar la pestaña de Colab o suspender tu Mac.
+   - Cada vez que finaliza una partición de tokens (`100k`, `250k`, `500k`, `1M`) o cada diálogo bi-temporal, el código hace un **guardado incremental** y lo copia de inmediato a tu Google Drive en:  
+     `/content/drive/MyDrive/PFC_RAG_Resultados/`
+   - Si la sesión se reinicia o se corta, tus datos no se pierden porque ya están a salvo en tu Drive.
+
+### Método B: Ejecución 100% Desacoplada vía Terminal (`nohup`)
+
+Si prefieres independizarte por completo de la interfaz web de Jupyter Notebook y evitar desconexiones por caídas del WebSocket del navegador:
+
+1. Abre el **Terminal de Colab Pro** (ícono `>_` en la esquina inferior izquierda de Colab).
+2. Ejecuta el orquestador general en segundo plano con `nohup`:
+   ```bash
+   cd /content/pfc1
+   nohup python -u run_all_experiments.py > experiments.log 2>&1 &
+   ```
+3. **Monitorear en cualquier momento**:
+   ```bash
+   # Ver las últimas líneas del registro en tiempo real
+   tail -n 30 -f /content/pfc1/experiments.log
+
+   # Verificar que el proceso sigue consumiendo GPU
+   nvidia-smi
+   ```
+
+### 💡 Tip Pro: Notificaciones de Finalización
+En Google Colab, ve a:  
+**Herramientas (Tools) $\rightarrow$ Ajustes (Settings) $\rightarrow$ Notificaciones (Notifications) $\rightarrow$ Activar notificaciones del navegador**.  
+Colab te enviará una notificación cuando todas las celdas hayan terminado.
+

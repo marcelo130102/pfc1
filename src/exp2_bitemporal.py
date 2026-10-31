@@ -549,6 +549,9 @@ async def run_experiment_2(
     cfg = config or ExperimentConfig()
     cfg.auto_configure_for_colab_gpu()
     inf_engine = engine or LocalInferenceEngine(cfg)
+    if not inf_engine.is_server_healthy():
+        print("[INFO] Servidor vLLM no detectado activo. Iniciando automáticamente...")
+        inf_engine.start_vllm_server(timeout_seconds=300)
 
     eval_cases = load_bitemporal_evaluation_cases(
         num_cases=cfg.exp2_num_dialogues
@@ -615,9 +618,13 @@ async def run_experiment_2(
                 "juez_rationale": light_eval["rationale"],
             }
         )
+        # Guardado incremental por caso para tolerancia a fallos en Colab
+        pd.DataFrame(detailed_rows).to_csv(csv_out_path, index=False, encoding="utf-8")
+        cfg.sync_to_google_drive(csv_out_path)
 
     df_detailed = pd.DataFrame(detailed_rows)
     df_detailed.to_csv(csv_out_path, index=False, encoding="utf-8")
+    cfg.sync_to_google_drive(csv_out_path)
 
     # Calcular resumen agregado (Recall Temporal 0-1 y % de Errores Anacrónicos)
     df_summary = (
