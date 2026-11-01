@@ -4,6 +4,8 @@ Repositorio oficial de código para los experimentos del Trabajo de Fin de Carre
 
 Diseñado para ejecutarse con **$0 de costo en APIs** en **Google Colab Pro / Google AI Pro** (GPU NVIDIA A100 / L4 + CPU High-RAM).
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marcelo130102/pfc1/blob/main/notebooks/PFC_Experimentos_RAG_Colab.ipynb)
+
 ---
 
 ## 1. Componentes Evaluados
