@@ -84,6 +84,27 @@ class ExperimentConfig:
             print(f"[DRIVE ADVERTENCIA] No se pudo sincronizar a Drive: {exc}")
         return False
 
+    def load_checkpoint_rows(self, filename: str) -> list:
+        """
+        Recupera filas ya calculadas de una corrida anterior para reanudar sin
+        repetir trabajo. Prioriza la copia en Google Drive (sobrevive a la
+        pérdida de la VM) y, si no existe, usa la copia local.
+        Desactivar con la variable de entorno PFC_RESUME=0.
+        """
+        if os.getenv("PFC_RESUME", "1") == "0":
+            return []
+        try:
+            import pandas as pd
+
+            for candidate in (self.google_drive_dir / filename, self.base_dir / filename):
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    rows = pd.read_csv(candidate).to_dict("records")
+                    print(f"[RESUME] {len(rows)} filas previas recuperadas desde: {candidate}")
+                    return rows
+        except Exception as exc:
+            print(f"[RESUME ADVERTENCIA] No se pudo leer el checkpoint '{filename}': {exc}")
+        return []
+
     @property
     def base_url(self) -> str:
         """Retorna la URL base compatible con el cliente de OpenAI."""

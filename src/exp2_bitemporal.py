@@ -560,13 +560,23 @@ async def run_experiment_2(
     lightrag_baseline = StaticLightRAGTemporalBaseline(cfg, inf_engine)
     judge = BiTemporalLLMJudge(inf_engine)
 
-    detailed_rows: List[Dict[str, Any]] = []
+    detailed_rows: List[Dict[str, Any]] = cfg.load_checkpoint_rows(cfg.exp2_csv_path)
+    # Un caso cuenta como terminado sólo si tiene ambas filas (Zep + LightRAG);
+    # los casos a medias se descartan y se vuelven a evaluar completos.
+    methods_per_case: Dict[str, set] = {}
+    for r in detailed_rows:
+        methods_per_case.setdefault(str(r.get("case_id")), set()).add(r.get("metodo"))
+    done_cases = {cid for cid, ms in methods_per_case.items() if len(ms) >= 2}
+    detailed_rows = [r for r in detailed_rows if str(r.get("case_id")) in done_cases]
     csv_out_path = cfg.base_dir / cfg.exp2_csv_path
 
     for case in tqdm(
         eval_cases,
         desc="Progreso Experimento 2 (Recuperación Bi-temporal + Juez LLM)",
     ):
+        if str(case.case_id) in done_cases:
+            continue
+
         # --- 1. Evaluar Zep / Graphiti (Modelo Bi-temporal VT x TT) ---
         zep_engine.reset()
         invalidated_edges = zep_engine.ingest_dialogue_turns(case.turns)

@@ -521,8 +521,14 @@ async def run_experiment_1(
     e2_indexer = E2GraphRAGIndexer(cfg, inf_engine)
     lightrag_indexer = LightRAGBaselineIndexer(cfg, inf_engine)
 
-    results: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = cfg.load_checkpoint_rows(cfg.exp1_csv_path)
+    done = {(r.get("metodo"), str(r.get("particion_label"))) for r in results}
     csv_out_path = cfg.base_dir / cfg.exp1_csv_path
+
+    def _checkpoint() -> None:
+        # Guardado incremental (local + Drive) para no perder progreso si la VM se cae
+        pd.DataFrame(results).to_csv(csv_out_path, index=False, encoding="utf-8")
+        cfg.sync_to_google_drive(csv_out_path)
 
     for part in tqdm(
         partitions, desc="Progreso Global Experimento 1 (Particiones)"
@@ -534,35 +540,38 @@ async def run_experiment_1(
         )
 
         # 1. Ejecutar E2GraphRAG (CPU SpaCy + GPU Summary Tree)
-        try:
-            e2_metrics = await e2_indexer.index_partition_async(part)
-            results.append(e2_metrics)
-            print(
-                f"  [E2GraphRAG] Latencia: {e2_metrics['latencia_s_por_mb']:.2f} s/MB | "
-                f"Tiempo Total: {e2_metrics['wall_clock_total_s']:.2f}s | "
-                f"Tokens LLM GPU: {e2_metrics['gpu_llm_total_tokens']:,}"
-            )
-        except Exception as exc:
-            print(
-                f"  [ERROR] Fallo en E2GraphRAG ({part.label}): {exc}"
-            )
+        if ("E2GraphRAG", str(part.label)) in done:
+            print(f"  [RESUME] E2GraphRAG ({part.label}) ya calculado. Se omite.")
+        else:
+            try:
+                e2_metrics = await e2_indexer.index_partition_async(part)
+                results.append(e2_metrics)
+                _checkpoint()
+                print(
+                    f"  [E2GraphRAG] Latencia: {e2_metrics['latencia_s_por_mb']:.2f} s/MB | "
+                    f"Tiempo Total: {e2_metrics['wall_clock_total_s']:.2f}s | "
+                    f"Tokens LLM GPU: {e2_metrics['gpu_llm_total_tokens']:,}"
+                )
+            except Exception as exc:
+                print(
+                    f"  [ERROR] Fallo en E2GraphRAG ({part.label}): {exc}"
+                )
 
         # 2. Ejecutar LightRAG (Baseline Estático Generativo)
-        try:
-            light_metrics = await lightrag_indexer.index_partition_async(part)
-            results.append(light_metrics)
-            print(
-                f"  [LightRAG]   Latencia: {light_metrics['latencia_s_por_mb']:.2f} s/MB | "
-                f"Tiempo Total: {light_metrics['wall_clock_total_s']:.2f}s | "
-                f"Tokens LLM GPU: {light_metrics['gpu_llm_total_tokens']:,}"
-            )
-        except Exception as exc:
-            print(f"  [ERROR] Fallo en LightRAG ({part.label}): {exc}")
-
-        # Guardado incremental tras cada partición para resiliencia en Colab
-        df_partial = pd.DataFrame(results)
-        df_partial.to_csv(csv_out_path, index=False, encoding="utf-8")
-        cfg.sync_to_google_drive(csv_out_path)
+        if ("LightRAG", str(part.label)) in done:
+            print(f"  [RESUME] LightRAG ({part.label}) ya calculado. Se omite.")
+        else:
+            try:
+                light_metrics = await lightrag_indexer.index_partition_async(part)
+                results.append(light_metrics)
+                _checkpoint()
+                print(
+                    f"  [LightRAG]   Latencia: {light_metrics['latencia_s_por_mb']:.2f} s/MB | "
+                    f"Tiempo Total: {light_metrics['wall_clock_total_s']:.2f}s | "
+                    f"Tokens LLM GPU: {light_metrics['gpu_llm_total_tokens']:,}"
+                )
+            except Exception as exc:
+                print(f"  [ERROR] Fallo en LightRAG ({part.label}): {exc}")
 
     df_final = pd.DataFrame(results)
     df_final.to_csv(csv_out_path, index=False, encoding="utf-8")
