@@ -32,6 +32,7 @@ REPO_URL = "https://github.com/marcelo130102/pfc1.git"
 REPO_DIR = "/content/pfc1"
 DRIVE_DIR = "/content/drive/MyDrive/PFC_RAG_Resultados"
 POLL_SECONDS = 30
+EXEC_TIMEOUT_SECONDS = 90
 NEO4J_VERSION = "5.26.21"
 NEO4J_HOME = f"/content/neo4j-community-{NEO4J_VERSION}"
 NEO4J_JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
@@ -212,6 +213,26 @@ else:
 """
 
 
+def colab_exec_short(session: str, code: str, cwd: Path, attempts: int = 3) -> subprocess.CompletedProcess:
+    """
+    Ejecuta un fragmento corto en la VM. `colab exec` puede colgarse sin respetar su propio
+    --timeout, y sin este límite el Mac esperaría para siempre con la VM cobrando.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return subprocess.run(
+                ["colab", "exec", "-s", session],
+                input=code,
+                text=True,
+                capture_output=True,
+                cwd=str(cwd),
+                timeout=EXEC_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[AVISO] colab exec no respondió (intento {attempt}/{attempts}).", flush=True)
+    return subprocess.CompletedProcess(args=["colab", "exec"], returncode=1, stdout="", stderr="colab exec no respondió")
+
+
 def sync_local_code_to_vm(session: str, repo_root: Path) -> None:
     """
     Sube los módulos locales (`src/*.py`, `scripts/*.py` y `run_all_experiments.py`) desde tu
@@ -225,13 +246,7 @@ def sync_local_code_to_vm(session: str, repo_root: Path) -> None:
         f"os.makedirs('{REPO_DIR}/src', exist_ok=True)\n"
         f"os.makedirs('{REPO_DIR}/scripts', exist_ok=True)\n"
     )
-    init_res = subprocess.run(
-        ["colab", "exec", "-s", session],
-        input=init_snippet,
-        text=True,
-        capture_output=True,
-        cwd=str(repo_root),
-    )
+    init_res = colab_exec_short(session, init_snippet, repo_root)
     if init_res.returncode != 0:
         raise RuntimeError(
             f"No se pudo preparar {REPO_DIR} en la VM: {init_res.stderr.strip()}"
@@ -327,13 +342,7 @@ def run_from_mac_laptop() -> None:
         last_report = 0.0
         while True:
             time.sleep(POLL_SECONDS)
-            res = subprocess.run(
-                ["colab", "exec", "-s", args.session],
-                input=REMOTE_POLL_SNIPPET,
-                text=True,
-                capture_output=True,
-                cwd=str(repo_root),
-            )
+            res = colab_exec_short(args.session, REMOTE_POLL_SNIPPET, repo_root)
             out_text = (res.stdout or "").strip()
             if "STATUS:DONE" in out_text:
                 tail_text = out_text.split("STATUS:DONE", 1)[-1].strip()

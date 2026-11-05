@@ -25,7 +25,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.colab_launch import PACKAGES, REPO_DIR, ensure_neo4j_on_vm, sync_local_code_to_vm
+from scripts.colab_launch import (
+    PACKAGES,
+    REPO_DIR,
+    colab_exec_short,
+    ensure_neo4j_on_vm,
+    sync_local_code_to_vm,
+)
 
 LOG_NAME = "smoke_test.log"
 PASS_MARKER = "SMOKE:PASS"
@@ -261,20 +267,10 @@ def run_checks_on_vm() -> int:
 # =============================================================================
 
 
-def colab_exec(session: str, code: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["colab", "exec", "-s", session],
-        input=code,
-        text=True,
-        capture_output=True,
-        cwd=str(REPO_ROOT),
-    )
-
-
 def run_from_mac(session: str) -> int:
     sync_local_code_to_vm(session=session, repo_root=REPO_ROOT)
 
-    started = colab_exec(session, START_SNIPPET)
+    started = colab_exec_short(session, START_SNIPPET, REPO_ROOT)
     if "STARTED" not in started.stdout:
         print(f"[ERROR] No se pudo iniciar la prueba en la VM:\n{started.stdout}\n{started.stderr}")
         return 1
@@ -285,7 +281,7 @@ def run_from_mac(session: str) -> int:
     output = ""
     while time.time() - t0 < MAX_WAIT_SECONDS:
         time.sleep(POLL_SECONDS)
-        res = colab_exec(session, POLL_SNIPPET)
+        res = colab_exec_short(session, POLL_SNIPPET, REPO_ROOT)
         if res.returncode == 0:
             output = (res.stdout or "").strip()
         if "STATUS:DONE" in output:
