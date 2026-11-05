@@ -24,6 +24,10 @@ from tqdm.auto import tqdm
 from src.config import ExperimentConfig
 
 
+class LLMGenerationError(RuntimeError):
+    """El servidor de inferencia no pudo generar una respuesta real."""
+
+
 @dataclass
 class GPUTokenTracker:
     """
@@ -106,6 +110,12 @@ class LocalInferenceEngine:
         self._embedder: Any = None
         self._spacy_nlp: Any = None
         self._tokenizer: Any = None
+        self._async_client: Optional[AsyncOpenAI] = None
+        self._sync_client: Optional[OpenAI] = None
+        # LightRAG captura internamente los errores del LLM: este contador permite
+        # detectar los fallos aunque la excepción no se propague hasta el experimento.
+        self.llm_failure_count: int = 0
+        self.last_llm_error: Optional[Exception] = None
 
     def _get_tokenizer(self):
         """Inicializa un tokenizador rápido (tiktoken cl100k_base) para conteo de tokens."""
@@ -129,12 +139,25 @@ class LocalInferenceEngine:
         return max(1, int(len(text.split()) * 1.3))
 
     def is_server_healthy(self) -> bool:
-        """Verifica si el servidor OpenAI-compatible responde en localhost:8000."""
+        """
+        Verifica si el servidor OpenAI-compatible responde en localhost:8000 y
+        sincroniza automáticamente `self.config.llm_model_id` con el modelo activo en vLLM.
+        """
+        import json
+
         url = f"{self.config.base_url}/models"
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=3.0) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    models_list = payload.get("data", [])
+                    if models_list and models_list[0].get("id"):
+                        active_id = models_list[0]["id"]
+                        if self.config.llm_model_id != active_id:
+                            self.config.llm_model_id = active_id
+                    return True
+                return False
         except Exception:
             return False
 
@@ -218,7 +241,10 @@ class LocalInferenceEngine:
         except Exception as exc:
             print(f"[ERROR] No se pudo iniciar vLLM: {exc}")
 
-        return False
+        raise RuntimeError(
+            f"El servidor vLLM no quedó disponible en {self.config.base_url}. "
+            f"Revisa {log_path}."
+        )
 
     def load_embedding_model(self) -> Any:
         """Carga el modelo denso multilingüe BAAI/bge-m3 en GPU."""
@@ -243,11 +269,9 @@ class LocalInferenceEngine:
             )
             print("[OK] Modelo BAAI/bge-m3 cargado correctamente.")
         except Exception as exc:
-            print(
-                f"[AVISO] No se pudo cargar SentenceTransformer ({exc}). "
-                "Usando generador de embeddings determinista de respaldo."
-            )
-            self._embedder = None
+            raise RuntimeError(
+                f"No se pudo cargar {self.config.embedding_model_id}: {exc}"
+            ) from exc
 
         return self._embedder
 
@@ -263,26 +287,13 @@ class LocalInferenceEngine:
         self.tracker.record_embedding_usage(total_toks)
 
         embedder = self.load_embedding_model()
-        if embedder is not None:
-            vectors = embedder.encode(
-                texts,
-                batch_size=self.config.embedding_batch_size,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            return np.asarray(vectors, dtype=np.float32)
-
-        # Fallback determinista por hash léxico si se ejecuta sin GPU/pesos
-        rng_vecs = np.zeros(
-            (len(texts), self.config.embedding_dim), dtype=np.float32
+        vectors = embedder.encode(
+            texts,
+            batch_size=self.config.embedding_batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
         )
-        for idx, txt in enumerate(texts):
-            seed = abs(hash(txt)) % (2**32 - 1)
-            rng = np.random.default_rng(seed)
-            vec = rng.standard_normal(self.config.embedding_dim, dtype=np.float32)
-            norm = np.linalg.norm(vec) + 1e-9
-            rng_vecs[idx] = vec / norm
-        return rng_vecs
+        return np.asarray(vectors, dtype=np.float32)
 
     def load_spacy_pipeline(self, lang: str = "en") -> Any:
         """
@@ -330,6 +341,15 @@ class LocalInferenceEngine:
 
         return self._spacy_nlp
 
+    def _llm_failure(self, exc: Exception) -> LLMGenerationError:
+        """Registra un fallo de generación y construye la excepción a propagar."""
+        self.llm_failure_count += 1
+        self.last_llm_error = exc
+        return LLMGenerationError(
+            f"Fallo del LLM '{self.config.llm_model_id}' en {self.config.base_url}: "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+
     async def generate_async(
         self,
         prompt: str,
@@ -347,10 +367,11 @@ class LocalInferenceEngine:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            client = AsyncOpenAI(
-                base_url=self.config.base_url, api_key=self.config.api_key
-            )
-            response = await client.chat.completions.create(
+            if self._async_client is None:
+                self._async_client = AsyncOpenAI(
+                    base_url=self.config.base_url, api_key=self.config.api_key
+                )
+            response = await self._async_client.chat.completions.create(
                 model=self.config.llm_model_id,
                 messages=messages,
                 temperature=temperature,
@@ -370,15 +391,7 @@ class LocalInferenceEngine:
                 self.tracker.record_llm_usage(p_toks, c_toks)
             return content.strip()
         except Exception as exc:
-            # Fallback local en caso de prueba en seco sin servidor vLLM activo
-            p_toks = self.count_tokens((system_prompt or "") + "\n" + prompt)
-            simulated_output = (
-                f"[ Síntesis generada localmente ({exc.__class__.__name__}) ] "
-                + prompt[:240].replace("\n", " ")
-            )
-            c_toks = self.count_tokens(simulated_output)
-            self.tracker.record_llm_usage(p_toks, c_toks)
-            return simulated_output
+            raise self._llm_failure(exc) from exc
 
     def generate_sync(
         self,
@@ -417,11 +430,4 @@ class LocalInferenceEngine:
                 self.tracker.record_llm_usage(p_toks, c_toks)
             return content.strip()
         except Exception as exc:
-            p_toks = self.count_tokens((system_prompt or "") + "\n" + prompt)
-            simulated_output = (
-                f"[ Síntesis generada localmente ({exc.__class__.__name__}) ] "
-                + prompt[:240].replace("\n", " ")
-            )
-            c_toks = self.count_tokens(simulated_output)
-            self.tracker.record_llm_usage(p_toks, c_toks)
-            return simulated_output
+            raise self._llm_failure(exc) from exc

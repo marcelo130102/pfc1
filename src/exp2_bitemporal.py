@@ -274,15 +274,6 @@ class ZepGraphitiBiTemporalEngine:
             max_tokens=180,
         )
 
-        # Si estamos en modo fallback sin vLLM activo, sintetizar a partir de la arista top-1
-        if llm_resp.startswith("[ Síntesis generada localmente") and valid_edges:
-            top_e = valid_edges[0]
-            llm_resp = (
-                f"En la ventana bi-temporal consultada (VT={case.query_vt[:10]}, "
-                f"TT={case.query_tt[:10]}), para {top_e.subject} el valor vigente de "
-                f"{top_e.predicate} es {top_e.object_value}."
-            )
-
         return llm_resp, context_snippets
 
 
@@ -371,17 +362,6 @@ class StaticLightRAGTemporalBaseline:
             max_tokens=180,
         )
 
-        # Si estamos en modo fallback sin vLLM activo, reflejar la agregación estática
-        # del nodo de LightRAG (que contiene concatenados todos los valores sin podar)
-        if llm_resp.startswith("[ Síntesis generada localmente"):
-            vals = self.entity_descriptions.get(entity_name, [])
-            # En búsqueda estática sin control bi-temporal, el nodo fusiona los valores
-            # o prioriza el primer chunk léxicamente más cercano
-            llm_resp = (
-                f"Según el grafo de conocimiento para {entity_name}, se registran "
-                f"los siguientes estados acumulados: {', '.join(vals)}."
-            )
-
         return llm_resp, retrieved_chunks
 
 
@@ -469,6 +449,7 @@ class BiTemporalLLMJudge:
                         bool(int(data["anachronistic_error"]))
                     ),
                     "rationale": str(data.get("rationale", "Evaluado por LLM-as-a-Judge")),
+                    "source": "llm",
                 }
         except Exception:
             pass
@@ -479,8 +460,7 @@ class BiTemporalLLMJudge:
         case: BiTemporalEvalCase, generated_answer: str
     ) -> Dict[str, Any]:
         """
-        Regla de auditoría determinista cuando la respuesta del LLM no incluye JSON
-        o durante ejecuciones rápidas de validación:
+        Regla de auditoría determinista cuando la respuesta del LLM no incluye JSON:
         - Verifica presencia de Ground Truth y ausencia de mezcla con trampas anacrónicas.
         """
         ans_lower = generated_answer.lower()
@@ -528,6 +508,7 @@ class BiTemporalLLMJudge:
             "temporal_recall": recall,
             "anachronistic_error": anach_err,
             "rationale": rationale,
+            "source": "auditoria_determinista",
         }
 
 
@@ -600,6 +581,7 @@ async def run_experiment_2(
                 "recall_temporal": zep_eval["temporal_recall"],
                 "error_anacronico": zep_eval["anachronistic_error"],
                 "juez_rationale": zep_eval["rationale"],
+                "juez_fuente": zep_eval["source"],
             }
         )
 
@@ -626,6 +608,7 @@ async def run_experiment_2(
                 "recall_temporal": light_eval["temporal_recall"],
                 "error_anacronico": light_eval["anachronistic_error"],
                 "juez_rationale": light_eval["rationale"],
+                "juez_fuente": light_eval["source"],
             }
         )
         # Guardado incremental por caso para tolerancia a fallos en Colab
@@ -653,6 +636,12 @@ async def run_experiment_2(
 
     print("\n=== RESUMEN EXPERIMENTO 2 (CONSISTENCIA BI-TEMPORAL) ===")
     print(df_summary.to_string(index=False))
+    audited = int((df_detailed["juez_fuente"] != "llm").sum())
+    if audited:
+        print(
+            f"[AVISO] {audited}/{len(df_detailed)} evaluaciones usaron la auditoría "
+            "determinista porque el Juez LLM no devolvió JSON válido."
+        )
     print(
         f"\n[OK] Resultados detallados exportados a: {csv_out_path.resolve()}"
     )

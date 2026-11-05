@@ -19,6 +19,7 @@ graphiti_cache/
 hf_cache/
 models/
 vllm_server.log
+smoke_test.log
 
 # Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
 .ipynb_checkpoints/

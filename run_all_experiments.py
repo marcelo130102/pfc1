@@ -11,9 +11,15 @@ Permite lanzar el pipeline experimental completo del PFC de una sola vez:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
+import platform
 import sys
 import time
+from datetime import datetime, timezone
+from importlib import metadata
+from pathlib import Path
 
 # Asegurar que el directorio raíz esté en sys.path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,14 +27,54 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from src.config import ExperimentConfig
+from src.data_loader import DATASET_PROVENANCE
 from src.exp1_indexing import run_experiment_1
 from src.exp2_bitemporal import run_experiment_2
 from src.inference_setup import LocalInferenceEngine
 from src.visualization import generate_all_figures
 
 
+def write_run_manifest(
+    config: ExperimentConfig, hardware: str, started_at: str, status: str
+) -> None:
+    """Guarda qué código, modelos y datos produjeron los resultados de esta corrida."""
+    code_files = [Path(BASE_DIR) / "run_all_experiments.py"] + sorted(
+        (Path(BASE_DIR) / "src").glob("*.py")
+    )
+    packages = {}
+    for name in ("vllm", "lightrag-hku", "graphiti-core", "openai", "spacy"):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            packages[name] = None
+
+    manifest = {
+        "status": status,
+        "started_at_utc": started_at,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "hardware": hardware,
+        "llm_model": config.llm_model_id,
+        "embedding_model": config.embedding_model_id,
+        "exp1_token_partitions": config.exp1_token_partitions,
+        "exp1_dataset": dict(DATASET_PROVENANCE),
+        "exp2_num_cases": config.exp2_num_dialogues,
+        "exp2_dataset": "escenarios sintéticos definidos en src/data_loader.py",
+        "resume_enabled": os.getenv("PFC_RESUME", "1") != "0",
+        "python": platform.python_version(),
+        "packages": packages,
+        "code_sha256": {
+            str(p.relative_to(BASE_DIR)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in code_files
+        },
+    }
+    out_path = config.base_dir / config.run_manifest_path
+    out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    config.sync_to_google_drive(out_path)
+
+
 async def main() -> None:
     t_start = time.time()
+    started_at = datetime.now(timezone.utc).isoformat()
     print("=" * 75)
     print("   PIPELINE EXPERIMENTAL COMPLETO DE GRAPHRAG (PFC) - EJECUCIÓN DESATENDIDA")
     print("=" * 75)
@@ -46,6 +92,8 @@ async def main() -> None:
         engine.start_vllm_server(timeout_seconds=300)
     else:
         print("[OK] Servidor vLLM ya se encuentra activo y saludable.")
+    print(f"[INFO] Modelo LLM activo: {config.llm_model_id}")
+    write_run_manifest(config, perfil_hw, started_at, status="en_curso")
 
     # 3. Experimento 1: Indexación escalonada
     print("\n" + "=" * 75)
@@ -69,6 +117,8 @@ async def main() -> None:
     print(f"[OK] Figuras generadas:")
     print(f"     - Figura 1: {fig1.resolve()}")
     print(f"     - Figura 2: {fig2.resolve()}")
+
+    write_run_manifest(config, perfil_hw, started_at, status="completado")
 
     elapsed_min = (time.time() - t_start) / 60.0
     print("\n" + "=" * 75)

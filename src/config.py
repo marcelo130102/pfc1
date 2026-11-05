@@ -44,20 +44,28 @@ class ExperimentConfig:
 
     # --- Experimento 1: Particiones escalonadas de LongMemEval (en tokens) ---
     exp1_token_partitions: List[int] = field(
-        default_factory=lambda: [100_000, 250_000, 500_000, 1_000_000]
+        default_factory=lambda: [
+            100_000,
+            250_000,
+            500_000,
+            1_000_000,
+            1_500_000,
+            2_500_000,
+        ]
     )
     e2_chunk_token_size: int = 1200
     e2_summary_tree_branching: int = 5
     e2_summary_max_levels: int = 3
 
-    # --- Experimento 2: Evaluación Bi-temporal en LongMemEval ---
-    exp2_num_dialogues: int = 30
+    # --- Experimento 2: Evaluación Bi-temporal en LongMemEval (100 casos x 5 estados = 200 evaluaciones) ---
+    exp2_num_dialogues: int = 100
     exp2_top_k_retrieval: int = 5
 
     # --- Rutas de Salida y Persistencia ---
     base_dir: Path = Path(os.getenv("PFC_BASE_DIR", "."))
     exp1_csv_path: str = "experimento1_resultados.csv"
     exp2_csv_path: str = "experimento2_resultados.csv"
+    run_manifest_path: str = "run_manifest.json"
     fig1_path: str = "fig1_latencia_indexacion.png"
     fig2_path: str = "fig2_bitemporal_recall_errores.png"
     google_drive_dir: Path = Path("/content/drive/MyDrive/PFC_RAG_Resultados")

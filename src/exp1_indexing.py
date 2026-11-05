@@ -328,73 +328,79 @@ class LightRAGBaselineIndexer:
             shutil.rmtree(work_dir, ignore_errors=True)
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        failures_before = self.engine.llm_failure_count
         t0_total = time.perf_counter()
         num_nodes = 0
         num_edges = 0
 
-        try:
-            from lightrag import LightRAG
-            from lightrag.utils import EmbeddingFunc
+        from lightrag import LightRAG
+        from lightrag.utils import EmbeddingFunc
 
-            async def _instrumented_llm_func(
-                prompt: str,
-                system_prompt: str | None = None,
-                history_messages: list = [],
-                **kwargs: Any,
-            ) -> str:
-                full_sys = system_prompt or ""
-                if history_messages:
-                    hist_str = "\n".join(
-                        f"{m.get('role', 'user')}: {m.get('content', '')}"
-                        for m in history_messages
-                    )
-                    full_sys = f"{full_sys}\n{hist_str}".strip()
-                return await self.engine.generate_async(
-                    prompt=prompt,
-                    system_prompt=full_sys,
-                    temperature=0.0,
-                    max_tokens=kwargs.get("max_tokens", 1024),
+        async def _instrumented_llm_func(
+            prompt: str,
+            system_prompt: str | None = None,
+            history_messages: list = [],
+            **kwargs: Any,
+        ) -> str:
+            full_sys = system_prompt or ""
+            if history_messages:
+                hist_str = "\n".join(
+                    f"{m.get('role', 'user')}: {m.get('content', '')}"
+                    for m in history_messages
                 )
-
-            async def _instrumented_embedding_func(
-                texts: List[str],
-            ) -> np.ndarray:
-                return self.engine.encode_texts(texts)
-
-            rag = LightRAG(
-                working_dir=str(work_dir),
-                llm_model_func=_instrumented_llm_func,
-                embedding_func=EmbeddingFunc(
-                    embedding_dim=self.config.embedding_dim,
-                    max_token_size=8192,
-                    func=_instrumented_embedding_func,
-                ),
-                chunk_token_size=self.config.e2_chunk_token_size,
+                full_sys = f"{full_sys}\n{hist_str}".strip()
+            return await self.engine.generate_async(
+                prompt=prompt,
+                system_prompt=full_sys,
+                temperature=0.0,
+                max_tokens=kwargs.get("max_tokens", 1024),
             )
-            if hasattr(rag, "initialize_storages"):
-                await rag.initialize_storages()
 
-            for doc in tqdm(
-                partition.documents,
-                desc=f"LightRAG [GPU]: Indexando partición {partition.label}",
-                leave=False,
-            ):
-                await rag.ainsert(doc)
+        async def _instrumented_embedding_func(
+            texts: List[str],
+        ) -> np.ndarray:
+            return self.engine.encode_texts(texts)
 
-            # Inspeccionar grafo GraphML generado por LightRAG si existe
-            graphml_files = list(work_dir.glob("*.graphml"))
-            if graphml_files:
-                g_loaded = nx.read_graphml(graphml_files[0])
-                num_nodes = g_loaded.number_of_nodes()
-                num_edges = g_loaded.number_of_edges()
+        rag = LightRAG(
+            working_dir=str(work_dir),
+            llm_model_func=_instrumented_llm_func,
+            llm_model_max_async=min(32, self.config.max_num_seqs),
+            embedding_func=EmbeddingFunc(
+                embedding_dim=self.config.embedding_dim,
+                max_token_size=8192,
+                func=_instrumented_embedding_func,
+            ),
+            chunk_token_size=self.config.e2_chunk_token_size,
+        )
+        if hasattr(rag, "initialize_storages"):
+            await rag.initialize_storages()
 
-        except Exception as exc:
-            print(
-                f"[AVISO] Ejecutando pipeline generativo equivalente de LightRAG "
-                f"(Detalle librería: {exc})..."
+        for doc in tqdm(
+            partition.documents,
+            desc=f"LightRAG [GPU]: Indexando partición {partition.label}",
+            leave=False,
+        ):
+            await rag.ainsert(doc)
+
+        # Inspeccionar grafo GraphML generado por LightRAG si existe
+        graphml_files = list(work_dir.glob("*.graphml"))
+        if graphml_files:
+            g_loaded = nx.read_graphml(graphml_files[0])
+            num_nodes = g_loaded.number_of_nodes()
+            num_edges = g_loaded.number_of_edges()
+
+        # LightRAG captura los errores del LLM y marca el documento como fallido sin
+        # propagar la excepción, así que se verifica explícitamente que hubo extracción.
+        new_failures = self.engine.llm_failure_count - failures_before
+        if new_failures:
+            raise RuntimeError(
+                f"LightRAG ({partition.label}): {new_failures} llamadas al LLM fallaron. "
+                f"Último error: {self.engine.last_llm_error!r}"
             )
-            num_nodes, num_edges = await self._run_generative_graph_extraction(
-                partition.documents
+        if num_nodes == 0:
+            raise RuntimeError(
+                f"LightRAG ({partition.label}) terminó con un grafo vacío: "
+                "la extracción de entidades no produjo resultados."
             )
 
         total_wall_s = time.perf_counter() - t0_total
@@ -421,72 +427,6 @@ class LightRAGBaselineIndexer:
             "nodos_arbol_resumen": 0,
             "peak_vram_gb": usage["peak_vram_gb"],
         }
-
-    async def _run_generative_graph_extraction(
-        self, documents: List[str]
-    ) -> Tuple[int, int]:
-        """
-        Ejecuta el prompt de extracción de entidades, descripciones y relaciones
-        con gaveling (2 pasadas por chunk) propio de la arquitectura LightRAG.
-        """
-        extraction_sys_prompt = (
-            "Goal: Given a text document, identify all entities and all relationships "
-            "among the identified entities. Format each entity as "
-            "(\"entity\"|<name>|<type>|<description>) and each relationship as "
-            "(\"relationship\"|<source>|<target>|<description>|<keywords>|<strength>)."
-        )
-        g_light = nx.Graph()
-        semaphore = asyncio.Semaphore(min(16, self.config.max_num_seqs))
-
-        async def _extract_chunk(idx: int, chunk_text: str) -> str:
-            async with semaphore:
-                # Pasada 1: Extracción principal de entidades y relaciones
-                resp1 = await self.engine.generate_async(
-                    prompt=f"Extract entities and relationships from:\n{chunk_text}",
-                    system_prompt=extraction_sys_prompt,
-                    temperature=0.0,
-                    max_tokens=600,
-                )
-                # Pasada 2 (Gleaning): Verificación de entidades omitidas en LightRAG
-                resp2 = await self.engine.generate_async(
-                    prompt=(
-                        f"Text:\n{chunk_text}\nPrevious extraction:\n{resp1}\n"
-                        "Many entities were missed in the last extraction. Add remaining entities:"
-                    ),
-                    system_prompt=extraction_sys_prompt,
-                    temperature=0.0,
-                    max_tokens=300,
-                )
-                return resp1 + "\n" + resp2
-
-        tasks = [
-            _extract_chunk(i, doc) for i, doc in enumerate(documents)
-        ]
-        outputs: List[str] = []
-        for coro in tqdm(
-            asyncio.as_completed(tasks),
-            total=len(tasks),
-            desc="LightRAG [GPU]: Extracción Generativa LLM por Chunk",
-            leave=False,
-        ):
-            outputs.append(await coro)
-
-        # Poblar grafo y vectorizar entidades/relaciones + chunks con BAAI/bge-m3
-        for idx, raw_out in enumerate(outputs):
-            lines = [ln.strip() for ln in raw_out.splitlines() if ln.strip()]
-            prev_node = f"entity_{idx}_primary"
-            g_light.add_node(prev_node)
-            for ln_i, ln in enumerate(lines[:8]):
-                node_id = f"ent_{idx}_{ln_i}_{abs(hash(ln)) % 1000}"
-                g_light.add_node(node_id, description=ln[:120])
-                g_light.add_edge(prev_node, node_id)
-                prev_node = node_id
-
-        # Vectorización en GPU de nodos, aristas y fragmentos (como realiza LightRAG)
-        node_texts = [str(n) for n in g_light.nodes()]
-        self.engine.encode_texts(documents + node_texts)
-
-        return g_light.number_of_nodes(), g_light.number_of_edges()
 
 
 # =============================================================================
@@ -543,35 +483,27 @@ async def run_experiment_1(
         if ("E2GraphRAG", str(part.label)) in done:
             print(f"  [RESUME] E2GraphRAG ({part.label}) ya calculado. Se omite.")
         else:
-            try:
-                e2_metrics = await e2_indexer.index_partition_async(part)
-                results.append(e2_metrics)
-                _checkpoint()
-                print(
-                    f"  [E2GraphRAG] Latencia: {e2_metrics['latencia_s_por_mb']:.2f} s/MB | "
-                    f"Tiempo Total: {e2_metrics['wall_clock_total_s']:.2f}s | "
-                    f"Tokens LLM GPU: {e2_metrics['gpu_llm_total_tokens']:,}"
-                )
-            except Exception as exc:
-                print(
-                    f"  [ERROR] Fallo en E2GraphRAG ({part.label}): {exc}"
-                )
+            e2_metrics = await e2_indexer.index_partition_async(part)
+            results.append(e2_metrics)
+            _checkpoint()
+            print(
+                f"  [E2GraphRAG] Latencia: {e2_metrics['latencia_s_por_mb']:.2f} s/MB | "
+                f"Tiempo Total: {e2_metrics['wall_clock_total_s']:.2f}s | "
+                f"Tokens LLM GPU: {e2_metrics['gpu_llm_total_tokens']:,}"
+            )
 
         # 2. Ejecutar LightRAG (Baseline Estático Generativo)
         if ("LightRAG", str(part.label)) in done:
             print(f"  [RESUME] LightRAG ({part.label}) ya calculado. Se omite.")
         else:
-            try:
-                light_metrics = await lightrag_indexer.index_partition_async(part)
-                results.append(light_metrics)
-                _checkpoint()
-                print(
-                    f"  [LightRAG]   Latencia: {light_metrics['latencia_s_por_mb']:.2f} s/MB | "
-                    f"Tiempo Total: {light_metrics['wall_clock_total_s']:.2f}s | "
-                    f"Tokens LLM GPU: {light_metrics['gpu_llm_total_tokens']:,}"
-                )
-            except Exception as exc:
-                print(f"  [ERROR] Fallo en LightRAG ({part.label}): {exc}")
+            light_metrics = await lightrag_indexer.index_partition_async(part)
+            results.append(light_metrics)
+            _checkpoint()
+            print(
+                f"  [LightRAG]   Latencia: {light_metrics['latencia_s_por_mb']:.2f} s/MB | "
+                f"Tiempo Total: {light_metrics['wall_clock_total_s']:.2f}s | "
+                f"Tokens LLM GPU: {light_metrics['gpu_llm_total_tokens']:,}"
+            )
 
     df_final = pd.DataFrame(results)
     df_final.to_csv(csv_out_path, index=False, encoding="utf-8")
