@@ -4,7 +4,7 @@ Incluye:
 - Lanzador y monitor de servidor vLLM / Ollama en localhost:8000.
 - Rastreador de consumo de tokens de GPU y memoria VRAM (GPUTokenTracker).
 - Modelo de embeddings densos BAAI/bge-m3 en GPU.
-- Pipeline SpaCy NER + Sentencizer optimizado para CPU multiproceso.
+- Pipeline SpaCy en CPU para E²GraphRAG.
 """
 
 from __future__ import annotations
@@ -137,6 +137,18 @@ class LocalInferenceEngine:
             return len(enc.encode(text, disallowed_special=()))
         # Fallback aproximado por palabras si tiktoken no está disponible
         return max(1, int(len(text.split()) * 1.3))
+
+    def split_into_chunks(self, text: str, chunk_size: int, overlap: int) -> List[str]:
+        """Divide un texto en fragmentos de `chunk_size` tokens con solapamiento."""
+        enc = self._get_tokenizer()
+        if enc is None:
+            raise RuntimeError("tiktoken es necesario para fragmentar por tokens.")
+        tokens = enc.encode(text, disallowed_special=())
+        step = chunk_size - overlap
+        return [
+            enc.decode(tokens[start : start + chunk_size])
+            for start in range(0, max(len(tokens) - overlap, 1), step)
+        ]
 
     def is_server_healthy(self) -> bool:
         """
@@ -296,49 +308,22 @@ class LocalInferenceEngine:
         return np.asarray(vectors, dtype=np.float32)
 
     def load_spacy_pipeline(self, lang: str = "en") -> Any:
-        """
-        Carga el modelo SpaCy en CPU optimizado para E2GraphRAG:
-        mantiene únicamente 'tok2vec', 'ner' y añade 'sentencizer' ligero.
-        """
+        """Carga el modelo SpaCy completo: E²GraphRAG usa sus etiquetas, lemas y oraciones."""
         if self._spacy_nlp is not None:
             return self._spacy_nlp
+
+        import spacy
 
         model_name = (
             self.config.spacy_model_en
             if lang == "en"
             else self.config.spacy_model_es
         )
-        try:
-            import spacy
-
-            try:
-                nlp = spacy.load(
-                    model_name, disable=["parser", "tagger", "lemmatizer", "attribute_ruler"]
-                )
-            except OSError:
-                print(f"[INFO] Descargando modelo SpaCy '{model_name}'...")
-                subprocess.run(
-                    ["python", "-m", "spacy", "download", model_name],
-                    check=True,
-                )
-                nlp = spacy.load(
-                    model_name, disable=["parser", "tagger", "lemmatizer", "attribute_ruler"]
-                )
-
-            if "sentencizer" not in nlp.pipe_names:
-                nlp.add_pipe("sentencizer", first=True)
-
-            # Aumentar límite de caracteres para particiones de hasta 1M tokens
-            nlp.max_length = 10_000_000
-            self._spacy_nlp = nlp
-            print(
-                f"[OK] Pipeline SpaCy '{model_name}' activo en CPU "
-                f"(pipes={nlp.pipe_names})."
-            )
-        except Exception as exc:
-            print(f"[ERROR] Error al inicializar SpaCy: {exc}")
-            self._spacy_nlp = None
-
+        nlp = spacy.load(model_name)
+        # Aumentar límite de caracteres para los fragmentos más largos
+        nlp.max_length = 10_000_000
+        self._spacy_nlp = nlp
+        print(f"[OK] Pipeline SpaCy '{model_name}' activo en CPU (pipes={nlp.pipe_names}).")
         return self._spacy_nlp
 
     def _llm_failure(self, exc: Exception) -> LLMGenerationError:
@@ -356,6 +341,7 @@ class LocalInferenceEngine:
         system_prompt: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 512,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Realiza una llamada asíncrona al servidor local vLLM / Ollama y registra
@@ -371,11 +357,13 @@ class LocalInferenceEngine:
                 self._async_client = AsyncOpenAI(
                     base_url=self.config.base_url, api_key=self.config.api_key
                 )
+            extra_args = {"response_format": response_format} if response_format else {}
             response = await self._async_client.chat.completions.create(
                 model=self.config.llm_model_id,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **extra_args,
             )
             content = response.choices[0].message.content or ""
             if response.usage:

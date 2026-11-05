@@ -1,18 +1,19 @@
 """
-Módulo de carga y preparación del dataset LongMemEval para los Experimentos 1 y 2.
-- Experimento 1: Particiones escalonadas por número exacto de tokens (100k, 250k, 500k,
-  1M, 1.5M, 2.5M) y cálculo de volumen en Megabytes (MB) para medir s/MB.
-- Experimento 2: 100 secuencias de diálogo con evolución temporal profunda (5 estados
-  t1 -> t2 -> t3 -> t4 -> t5), hechos contradictorios/actualizados, 4 categorías de
-  consultas en ventana bi-temporal (t_VT, t_TT) y Respuestas Oro (Ground Truth).
+Módulo de carga y preparación de datos para los Experimentos 1 y 2.
+- Experimento 1: particiones escalonadas de sesiones reales de LongMemEval por número de
+  tokens (100k a 2.5M), y preguntas de LongMemEval para medir la calidad de respuesta.
+- Experimento 2: preguntas 'temporal-reasoning' y 'knowledge-update' de LongMemEval, más
+  escenarios bi-temporales SINTÉTICOS con hechos tardíos y correcciones retroactivas
+  (LongMemEval no distingue tiempo de validez y tiempo de transacción).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from tqdm.auto import tqdm
@@ -24,6 +25,8 @@ LONGMEMEVAL_FILENAME = "longmemeval_oracle.json"
 # Se completa al cargar el corpus; run_all_experiments.py lo guarda en el manifiesto.
 DATASET_PROVENANCE: Dict[str, Any] = {}
 
+_RECORDS_CACHE: List[Dict[str, Any]] = []
+
 
 @dataclass
 class TokenPartition:
@@ -33,6 +36,7 @@ class TokenPartition:
     actual_tokens: int
     size_mb: float
     documents: List[str]
+    session_ids: List[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -44,46 +48,58 @@ class TokenPartition:
 
 
 @dataclass
-class TemporalTurn:
-    """Evento o sesión de diálogo individual con tiempos de validez (VT) y transacción (TT)."""
+class TemporalEpisode:
+    """Sesión ingerida en la fecha `recorded_at`, que es su tiempo de transacción (TT)."""
 
-    session_id: str
-    speaker: str
+    episode_id: str
     text: str
-    subject: str
-    predicate: str
-    object_value: str
-    valid_from: str  # ISO-8601 (Inicio de validez del hecho en el mundo real: t_VT)
-    tx_timestamp: str  # ISO-8601 (Estampa de tiempo de ingesta en el sistema: t_TT)
-    supersedes_object: Optional[str] = None
+    recorded_at: datetime
 
 
 @dataclass
-class BiTemporalEvalCase:
+class EvalCase:
     """
-    Caso de evaluación para el Experimento 2 (Recuperación Bi-temporal).
-    Incluye una secuencia de 5 turnos con actualizaciones sucesivas de estado, una consulta
-    en la ventana (t_VT, t_TT), la respuesta oro vigente en ese punto temporal
-    y los datos obsoletos/futuros que causarían un error anacrónico.
+    Pregunta del Experimento 2. Los casos con el mismo `group_id` comparten los mismos
+    episodios y se responden sobre un único índice.
+    En LongMemEval, `query_vt` y `query_tt` son la fecha de la pregunta.
     """
 
     case_id: str
-    category: str  # 'knowledge-update' | 'point-in-time-vt' | 'bitemporal-tt-rollback' | 'retroactive-audit'
-    turns: List[TemporalTurn]
+    source: str  # 'longmemeval' | 'sintetico'
+    group_id: str
+    category: str
+    episodes: List[TemporalEpisode]
     question: str
-    query_vt: str  # Tiempo de validez consultado (t_VT)
-    query_tt: str  # Tiempo de transacción consultado (t_TT)
-    ground_truth: str  # Respuesta Oro esperada en (t_VT, t_TT)
-    anachronistic_trap: str  # Datos de otras épocas que NO deben mezclarse en la respuesta
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    ground_truth: str
+    query_vt: Optional[datetime] = None
+    query_tt: Optional[datetime] = None
+    anachronistic_traps: List[str] = field(default_factory=list)
 
 
-def _fetch_raw_longmemeval_texts() -> List[str]:
+@dataclass
+class QualityQuestion:
+    """Pregunta de LongMemEval usada para medir la calidad de respuesta del Experimento 1."""
+
+    question_id: str
+    question_type: str
+    question: str
+    answer: str
+    session_ids: List[str]
+
+
+def is_pilot_question(question_id: str) -> bool:
+    """Reserva de forma determinista cerca del 10% de las preguntas para el piloto."""
+    return int(hashlib.sha256(question_id.encode("utf-8")).hexdigest(), 16) % 10 == 0
+
+
+def _load_longmemeval_records() -> List[Dict[str, Any]]:
     """
-    Descarga los historiales multi-sesión de LongMemEval desde HuggingFace Hub y
-    devuelve una sesión única por documento. Cualquier fallo de descarga o de formato
+    Descarga LongMemEval desde HuggingFace Hub. Cualquier fallo de descarga o de formato
     detiene la corrida: los resultados nunca se calculan sobre otro corpus.
     """
+    if _RECORDS_CACHE:
+        return _RECORDS_CACHE
+
     from huggingface_hub import hf_hub_download
 
     local_json = hf_hub_download(
@@ -93,39 +109,44 @@ def _fetch_raw_longmemeval_texts() -> List[str]:
     )
     with open(local_json, "rb") as fh:
         raw_bytes = fh.read()
-    records = json.loads(raw_bytes)
+    _RECORDS_CACHE.extend(json.loads(raw_bytes))
+    DATASET_PROVENANCE.update(
+        repo_id=LONGMEMEVAL_REPO_ID,
+        filename=LONGMEMEVAL_FILENAME,
+        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        questions=len(_RECORDS_CACHE),
+    )
+    return _RECORDS_CACHE
 
+
+def _format_session(date: str, session: List[Dict[str, Any]]) -> str:
+    turn_texts = [f"{turn['role'].capitalize()}: {turn['content']}" for turn in session]
+    return f"[Date: {date}] " + "\n".join(turn_texts)
+
+
+def _fetch_raw_longmemeval_texts() -> Dict[str, str]:
+    """Devuelve el texto de cada sesión única de LongMemEval, indexado por su identificador."""
     # Una misma sesión puede pertenecer a varias preguntas: se conserva una sola copia
     sessions_by_id: Dict[str, str] = {}
-    for row in records:
+    for row in _load_longmemeval_records():
         for session_id, date, session in zip(
             row["haystack_session_ids"],
             row["haystack_dates"],
             row["haystack_sessions"],
         ):
-            if session_id in sessions_by_id:
-                continue
-            turn_texts = [
-                f"{turn['role'].capitalize()}: {turn['content']}" for turn in session
-            ]
-            sessions_by_id[session_id] = f"[Date: {date}] " + "\n".join(turn_texts)
+            if session_id not in sessions_by_id:
+                sessions_by_id[session_id] = _format_session(date, session)
 
     if not sessions_by_id:
         raise ValueError(
             f"{LONGMEMEVAL_REPO_ID}/{LONGMEMEVAL_FILENAME} no contiene sesiones."
         )
-
-    DATASET_PROVENANCE.update(
-        repo_id=LONGMEMEVAL_REPO_ID,
-        filename=LONGMEMEVAL_FILENAME,
-        sha256=hashlib.sha256(raw_bytes).hexdigest(),
-        unique_sessions=len(sessions_by_id),
-    )
+    DATASET_PROVENANCE["unique_sessions"] = len(sessions_by_id)
     print(
         f"[OK] Se extrajeron {len(sessions_by_id):,} sesiones reales de LongMemEval "
         f"({LONGMEMEVAL_REPO_ID}/{LONGMEMEVAL_FILENAME})."
     )
-    return list(sessions_by_id.values())
+    return sessions_by_id
 
 
 def load_longmemeval_partitions(
@@ -138,7 +159,8 @@ def load_longmemeval_partitions(
     para el Experimento 1, agrupadas en documentos de ~chunk_token_size tokens.
     Calcula el peso exacto en Megabytes (MB) de cada partición.
     """
-    raw_sessions = _fetch_raw_longmemeval_texts()
+    sessions_by_id = _fetch_raw_longmemeval_texts()
+    all_session_ids = list(sessions_by_id)
     partitions: List[TokenPartition] = []
 
     for target in tqdm(
@@ -152,12 +174,12 @@ def load_longmemeval_partitions(
 
         while accumulated_tokens < target:
             # Repetir sesiones inflaría el tamaño con contenido duplicado
-            if session_idx >= len(raw_sessions):
+            if session_idx >= len(all_session_ids):
                 raise ValueError(
                     f"El corpus solo tiene {accumulated_tokens:,} tokens, insuficientes "
                     f"para la partición de {target:,} tokens."
                 )
-            session_str = raw_sessions[session_idx]
+            session_str = sessions_by_id[all_session_ids[session_idx]]
 
             tok_len = token_counter(session_str)
             current_chunk_lines.append(session_str)
@@ -179,252 +201,206 @@ def load_longmemeval_partitions(
                 actual_tokens=accumulated_tokens,
                 size_mb=round(size_mb, 4),
                 documents=docs,
+                session_ids=all_session_ids[:session_idx],
             )
         )
 
     return partitions
 
 
+def load_quality_questions(
+    available_session_ids: List[str],
+    max_questions: int,
+    seed: int = 42,
+    pilot: bool = False,
+) -> List[QualityQuestion]:
+    """
+    Selecciona preguntas de LongMemEval cuyas sesiones de evidencia están todas dentro
+    de la partición indexada, con una muestra reproducible.
+    """
+    available = set(available_session_ids)
+    questions = [
+        QualityQuestion(
+            question_id=row["question_id"],
+            question_type=row["question_type"],
+            question=row["question"],
+            answer=str(row["answer"]),
+            session_ids=list(row["haystack_session_ids"]),
+        )
+        for row in _load_longmemeval_records()
+        if set(row["haystack_session_ids"]) <= available
+        and is_pilot_question(row["question_id"]) == pilot
+    ]
+    random.Random(seed).shuffle(questions)
+    return questions[:max_questions]
+
+
+def parse_longmemeval_date(date: str) -> datetime:
+    """Convierte fechas de LongMemEval como '2023/04/10 (Mon) 17:50' a datetime UTC."""
+    return datetime.strptime(date, "%Y/%m/%d (%a) %H:%M").replace(tzinfo=timezone.utc)
+
+
+def load_longmemeval_temporal_cases(
+    max_cases: Optional[int] = None, seed: int = 42, pilot: bool = False
+) -> List[EvalCase]:
+    """
+    Construye un caso por cada pregunta temporal de LongMemEval, con sus sesiones. La
+    fecha de la pregunta sirve de ventana (VT = TT) para la capa as-of exploratoria.
+    """
+    cases: List[EvalCase] = []
+    for row in _load_longmemeval_records():
+        if row["question_type"] not in ("temporal-reasoning", "knowledge-update"):
+            continue
+        if is_pilot_question(row["question_id"]) != pilot:
+            continue
+        episodes = [
+            TemporalEpisode(
+                episode_id=session_id,
+                text=_format_session(date, session),
+                recorded_at=parse_longmemeval_date(date),
+            )
+            for session_id, date, session in zip(
+                row["haystack_session_ids"],
+                row["haystack_dates"],
+                row["haystack_sessions"],
+            )
+        ]
+        cases.append(
+            EvalCase(
+                case_id=f"LME_{row['question_id']}",
+                source="longmemeval",
+                group_id=f"LME_{row['question_id']}",
+                category=row["question_type"],
+                episodes=sorted(episodes, key=lambda e: e.recorded_at),
+                question=f"[Question date: {row['question_date']}] {row['question']}",
+                ground_truth=str(row["answer"]),
+                query_vt=parse_longmemeval_date(row["question_date"]),
+                query_tt=parse_longmemeval_date(row["question_date"]),
+            )
+        )
+    if max_cases is not None:
+        cases = random.Random(seed).sample(cases, min(max_cases, len(cases)))
+    return cases
+
+
+# Atributos de los escenarios sintéticos: (sujetos, etiqueta del atributo, valores posibles)
+_SYNTHETIC_ATTRIBUTES = [
+    (
+        ["Carlos Mendoza", "Priya Raman", "Tomas Novak", "Aiko Sato", "Lena Fischer"],
+        "city of residence",
+        ["Barcelona", "Munich", "Zurich", "Stockholm", "Singapore", "Lima", "Oslo", "Porto"],
+    ),
+    (
+        ["Valeria Gomez", "Daniel Osei", "Marta Silva", "Ivan Petrov", "Sara Haddad"],
+        "employer",
+        ["Hospital Clinic", "Max Planck Institute", "ETH AI Center", "MIT CSAIL",
+         "Karolinska Institute", "Charite Berlin", "Institut Pasteur", "Imperial College"],
+    ),
+    (
+        ["Elena Rostova", "Hugo Laurent", "Nadia Karim", "Paolo Conti", "Grace Mbeki"],
+        "prescribed medication",
+        ["Metformin 500mg", "Sitagliptin 100mg", "Empagliflozin 10mg", "Semaglutide 1mg",
+         "Liraglutide 1.2mg", "Glipizide 5mg", "Pioglitazone 15mg", "Dapagliflozin 10mg"],
+    ),
+    (
+        ["Project Helios", "Project Orion", "Project Vega", "Project Lyra", "Project Atlas"],
+        "main database",
+        ["PostgreSQL", "MongoDB", "Neo4j", "FalkorDB", "Cassandra", "Redis", "MariaDB", "CockroachDB"],
+    ),
+    (
+        ["Andes Cloud", "Vertex BioLabs", "NovaTech Robotics", "Aether Biomedical", "Zephyr Systems"],
+        "annual AI budget",
+        ["1.2 million USD", "2.8 million USD", "4.5 million USD", "7 million USD",
+         "9.5 million USD", "12 million USD", "15 million USD", "21 million USD"],
+    ),
+    (
+        ["Mateo Soriano", "Ingrid Larsen", "Kofi Mensah", "Yuki Tanaka", "Clara Weiss"],
+        "job title",
+        ["Senior Researcher", "Technical Lead", "Engineering Director", "Vice President of AI",
+         "Chief AI Officer", "Principal Scientist", "Head of Research", "Staff Engineer"],
+    ),
+]
+
+
 def load_bitemporal_evaluation_cases(
-    num_cases: int = 100,
-) -> List[BiTemporalEvalCase]:
+    num_scenarios: int = 30, seed: int = 42
+) -> List[EvalCase]:
     """
-    Genera 100 secuencias de diálogo sintéticas (escenarios definidos aquí, no
-    provenientes de LongMemEval) con evolución temporal profunda de 5 estados (t1 -> t2 -> t3 -> t4 -> t5), hechos
-    contradictorios/actualizados y consultas en la ventana bi-temporal (t_VT, t_TT)
-    para el Experimento 2.
-
-    Cubre cuatro escenarios críticos del Problema P2:
-    1. 'knowledge-update': Estado actual tras 5 actualizaciones (debe devolver v5 e invalidar v1..v4).
-    2. 'point-in-time-vt': Consulta histórica 'as-of' en t_VT intermedio [t3, t4) (debe recuperar v3).
-    3. 'bitemporal-tt-rollback': Consulta en tiempo de transacción t_TT entre [t2, t3) (debe recuperar v2).
-    4. 'retroactive-audit': Auditoría del estado fundacional en la ventana inicial [t1, t2) (debe recuperar v1).
+    Genera escenarios bi-temporales SINTÉTICOS en los que VT y TT difieren de verdad:
+    1. En T1 se registra el valor A.
+    2. En T3 se informa tarde que el valor cambió a B en T2 (T2 < T3).
+    3. En T4 se corrige lo anterior: el cambio de T2 fue en realidad a C.
+    Cada escenario genera cinco preguntas con la misma pregunta base y distinta ventana.
     """
-    scenarios = [
-        {
-            "entity": "Carlos Mendoza",
-            "predicate": "residencia_actual",
-            "attribute_label": "ciudad de residencia",
-            "values": ["Barcelona", "Múnich", "Zúrich", "Estocolmo", "Singapur"],
-        },
-        {
-            "entity": "Dra. Valeria Gómez",
-            "predicate": "organizacion_empleadora",
-            "attribute_label": "centro de investigación donde trabaja",
-            "values": [
-                "Hospital Clínic",
-                "Instituto Max Planck",
-                "ETH AI Center",
-                "MIT CSAIL",
-                "DeepMind Zurich",
-            ],
-        },
-        {
-            "entity": "Proyecto Helios",
-            "predicate": "arquitectura_base_datos",
-            "attribute_label": "motor de base de datos principal",
-            "values": ["PostgreSQL", "MongoDB", "Neo4j", "FalkorDB", "Spanner Graph"],
-        },
-        {
-            "entity": "Elena Rostova",
-            "predicate": "tratamiento_medico",
-            "attribute_label": "medicación prescrita y dosis",
-            "values": [
-                "Metformina 500mg",
-                "Metformina 850mg",
-                "Sitagliptina 100mg",
-                "Empagliflozina 10mg",
-                "Semaglutida 1mg",
-            ],
-        },
-        {
-            "entity": "Andes Cloud Systems",
-            "predicate": "presupuesto_anual_ia",
-            "attribute_label": "presupuesto anual aprobado de IA",
-            "values": [
-                "1.2 millones USD",
-                "2.0 millones USD",
-                "2.8 millones USD",
-                "4.5 millones USD",
-                "7.0 millones USD",
-            ],
-        },
-        {
-            "entity": "Dr. Mateo Soriano",
-            "predicate": "rol_directivo",
-            "attribute_label": "cargo directivo",
-            "values": [
-                "Investigador Senior",
-                "Líder Técnico de Grafos",
-                "Director de Ingeniería RAG",
-                "Vicepresidente de IA",
-                "Chief AI Officer (CAIO)",
-            ],
-        },
-        {
-            "entity": "Plataforma Chronos",
-            "predicate": "cluster_entrenamiento",
-            "attribute_label": "acelerador de hardware asignado",
-            "values": [
-                "NVIDIA T4 16GB",
-                "NVIDIA A10G 24GB",
-                "NVIDIA L4 24GB",
-                "NVIDIA A100 80GB",
-                "NVIDIA H100 80GB",
-            ],
-        },
-        {
-            "entity": "Consorcio Aegis",
-            "predicate": "protocolo_cifrado",
-            "attribute_label": "estándar criptográfico activo",
-            "values": [
-                "RSA-2048",
-                "RSA-4096",
-                "ECDSA P-256",
-                "Ed25519",
-                "ML-KEM-768 Post-Quantum",
-            ],
-        },
-        {
-            "entity": "NovaTech Robotics",
-            "predicate": "sede_corporativa",
-            "attribute_label": "sede fiscal corporativa",
-            "values": ["Madrid", "Dublín", "Ámsterdam", "Londres", "Boston"],
-        },
-        {
-            "entity": "Motor Atlas RAG",
-            "predicate": "modelo_generativo_base",
-            "attribute_label": "modelo LLM de producción",
-            "values": [
-                "Llama-2-7B",
-                "Mistral-7B-v0.2",
-                "Llama-3-8B",
-                "Qwen2.5-7B-Instruct",
-                "Llama-3.1-70B-Instruct",
-            ],
-        },
+    rng = random.Random(seed)
+    subjects = [
+        (subject, label, values)
+        for group, label, values in _SYNTHETIC_ATTRIBUTES
+        for subject in group
     ]
+    rng.shuffle(subjects)
+    if num_scenarios > len(subjects):
+        raise ValueError(f"Solo hay {len(subjects)} sujetos para los escenarios sintéticos.")
 
-    # 5 marcas temporales escalonadas (VT y TT) para las 5 transiciones de estado
-    timestamps = [
-        ("2023-01-15T09:00:00Z", "2023-01-15T09:05:00Z"),  # t1 (v1)
-        ("2023-07-20T11:00:00Z", "2023-07-20T11:05:00Z"),  # t2 (v2)
-        ("2024-02-10T14:00:00Z", "2024-02-10T14:05:00Z"),  # t3 (v3)
-        ("2024-09-05T16:00:00Z", "2024-09-05T16:05:00Z"),  # t4 (v4)
-        ("2025-03-01T10:00:00Z", "2025-03-01T10:05:00Z"),  # t5 (v5)
-    ]
+    cases: List[EvalCase] = []
+    for idx, (subject, label, values) in enumerate(subjects[:num_scenarios]):
+        value_a, value_b, value_c = rng.sample(values, 3)
+        t1 = datetime(2023, 1, 1, tzinfo=timezone.utc) + timedelta(days=rng.randint(0, 120))
+        t2 = t1 + timedelta(days=rng.randint(150, 240))
+        t3 = t2 + timedelta(days=rng.randint(100, 160))
+        t4 = t3 + timedelta(days=rng.randint(120, 200))
+        now = t4 + timedelta(days=rng.randint(30, 90))
+        # Dentro del periodo en que el cambio de T2 aún no se había informado
+        between = t2 + timedelta(days=60)
 
-    eval_cases: List[BiTemporalEvalCase] = []
-    query_modes = [
-        "knowledge-update",
-        "point-in-time-vt",
-        "bitemporal-tt-rollback",
-        "retroactive-audit",
-    ]
+        def _day(moment: datetime) -> str:
+            return moment.strftime("%Y-%m-%d")
 
-    for idx in range(num_cases):
-        sc = scenarios[idx % len(scenarios)]
-        mode = query_modes[idx % len(query_modes)]
-        vals = sc["values"]
-        entity_name = (
-            sc["entity"]
-            if idx < len(scenarios)
-            else f"{sc['entity']} (Exp #{idx + 1})"
-        )
-
-        turns: List[TemporalTurn] = []
-        for step_i, val in enumerate(vals):
-            t_vt, t_tt = timestamps[step_i]
-            prev_val = vals[step_i - 1] if step_i > 0 else None
-            if step_i == 0:
-                turn_txt = (
-                    f"[Timestamp: {t_vt}] Registro inicial: Para {entity_name}, "
-                    f"su {sc['attribute_label']} es {val}."
-                )
-            else:
-                turn_txt = (
-                    f"[Timestamp: {t_vt}] Actualización #{step_i}: A partir de esta fecha, "
-                    f"para {entity_name}, su {sc['attribute_label']} cambió de {prev_val} a {val} "
-                    f"(quedando {prev_val} obsoleto)."
-                )
-            turns.append(
-                TemporalTurn(
-                    session_id=f"case_{idx:03d}_s{step_i + 1}",
-                    speaker="User",
-                    text=turn_txt,
-                    subject=entity_name,
-                    predicate=sc["predicate"],
-                    object_value=val,
-                    valid_from=t_vt,
-                    tx_timestamp=t_tt,
-                    supersedes_object=prev_val,
+        group_id = f"SYN_{idx + 1:02d}"
+        episodes = [
+            TemporalEpisode(
+                f"{group_id}_e1",
+                f"[Date: {_day(t1)}] User: Please note that the {label} of {subject} is {value_a}.",
+                t1,
+            ),
+            TemporalEpisode(
+                f"{group_id}_e2",
+                f"[Date: {_day(t3)}] User: I forgot to tell you earlier: on {_day(t2)}, "
+                f"the {label} of {subject} changed to {value_b}.",
+                t3,
+            ),
+            TemporalEpisode(
+                f"{group_id}_e3",
+                f"[Date: {_day(t4)}] User: Correction to what I told you before: the change on "
+                f"{_day(t2)} was actually to {value_c}, not {value_b}. The {label} of {subject} "
+                f"has been {value_c} since {_day(t2)}.",
+                t4,
+            ),
+        ]
+        # (categoría, tiempo de validez, tiempo de transacción, respuesta, trampas)
+        windows = [
+            ("current-state", now, now, value_c, [value_a, value_b]),
+            ("tt-before-late-arrival", between, t3 - timedelta(days=1), value_a, [value_b, value_c]),
+            ("tt-after-late-arrival", between, t3 + timedelta(days=30), value_b, [value_a, value_c]),
+            ("retroactive-correction", between, now, value_c, [value_a, value_b]),
+            ("pre-change-audit", t2 - timedelta(days=30), now, value_a, [value_b, value_c]),
+        ]
+        for category, query_vt, query_tt, answer, traps in windows:
+            cases.append(
+                EvalCase(
+                    case_id=f"{group_id}_{category}",
+                    source="sintetico",
+                    group_id=group_id,
+                    category=category,
+                    episodes=episodes,
+                    question=(
+                        f"Based only on what had been recorded as of {_day(query_tt)}, "
+                        f"what was the {label} of {subject} on {_day(query_vt)}?"
+                    ),
+                    ground_truth=answer,
+                    query_vt=query_vt,
+                    query_tt=query_tt,
+                    anachronistic_traps=traps,
                 )
             )
-
-        if mode == "knowledge-update":
-            # Consulta tras las 5 actualizaciones: respuesta vigente v5, trampas v1..v4
-            q_vt = "2025-06-15T00:00:00Z"
-            q_tt = "2025-06-15T00:00:00Z"
-            question = (
-                f"Según el estado vigente en {q_vt[:10]}, ¿cuál es exactamente "
-                f"el/la {sc['attribute_label']} actual de {entity_name}?"
-            )
-            gt = vals[4]
-            traps = [vals[0], vals[1], vals[2], vals[3]]
-        elif mode == "point-in-time-vt":
-            # Consulta histórica as-of entre t3 y t4 (ej. mayo 2024): vigente era v3
-            q_vt = "2024-05-20T00:00:00Z"
-            q_tt = "2025-06-15T00:00:00Z"
-            question = (
-                f"Consulta histórica (As-Of {q_vt[:10]}): ¿Cuál era el/la "
-                f"{sc['attribute_label']} de {entity_name} específicamente en la fecha {q_vt[:10]}?"
-            )
-            gt = vals[2]
-            traps = [vals[0], vals[1], vals[3], vals[4]]
-        elif mode == "bitemporal-tt-rollback":
-            # Consulta bi-temporal con corte de transacción entre t2 y t3 (noviembre 2023): v2
-            q_vt = "2023-11-10T00:00:00Z"
-            q_tt = "2023-11-10T00:00:00Z"
-            question = (
-                f"Consulta bi-temporal (VT={q_vt[:10]}, TT={q_tt[:10]}): Con la información "
-                f"registrada en el sistema hasta {q_tt[:10]}, ¿cuál era el/la {sc['attribute_label']} de {entity_name}?"
-            )
-            gt = vals[1]
-            traps = [vals[0], vals[2], vals[3], vals[4]]
-        else:
-            # 'retroactive-audit': Auditoría en la ventana inicial [t1, t2) (abril 2023): v1
-            q_vt = "2023-04-01T00:00:00Z"
-            q_tt = "2025-06-15T00:00:00Z"
-            question = (
-                f"Auditoría temporal (VT={q_vt[:10]}, TT={q_tt[:10]}): ¿Cuál era el valor "
-                f"original vigente en {q_vt[:10]} para el/la {sc['attribute_label']} de {entity_name}?"
-            )
-            gt = vals[0]
-            traps = [vals[1], vals[2], vals[3], vals[4]]
-
-        eval_cases.append(
-            BiTemporalEvalCase(
-                case_id=f"LME_BT_{idx + 1:03d}",
-                category=mode,
-                turns=turns,
-                question=question,
-                query_vt=q_vt,
-                query_tt=q_tt,
-                ground_truth=gt,
-                anachronistic_trap=" | ".join(traps),
-                metadata={
-                    "entity": entity_name,
-                    "predicate": sc["predicate"],
-                    "attribute_label": sc["attribute_label"],
-                    "num_state_transitions": len(vals),
-                },
-            )
-        )
-
-    return eval_cases
-
-
-def parse_iso_timestamp(ts_str: str) -> datetime:
-    """Convierte una cadena ISO-8601 a objeto datetime UTC para comparaciones de intervalos."""
-    cleaned = ts_str.strip().replace("Z", "+00:00")
-    return datetime.fromisoformat(cleaned)
+    return cases

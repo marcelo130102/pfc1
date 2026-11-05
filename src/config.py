@@ -19,7 +19,7 @@ class ExperimentConfig:
 
     # --- Modelos de Inferencia Local ($0 API Cost) ---
     llm_model_id: str = os.getenv(
-        "PFC_LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct"
+        "PFC_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"
     )
     fallback_llm_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
     embedding_model_id: str = "BAAI/bge-m3"
@@ -30,8 +30,13 @@ class ExperimentConfig:
     vllm_port: int = 8000
     api_key: str = "EMPTY"
 
+    # --- Neo4j local de Graphiti (solo escucha en localhost de la VM) ---
+    neo4j_uri: str = os.getenv("PFC_NEO4J_URI", "bolt://127.0.0.1:7687")
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = os.getenv("PFC_NEO4J_PASSWORD", "pfc-local-neo4j")
+
     # --- Modelos SpaCy para extracción NER en CPU (E2GraphRAG) ---
-    spacy_model_en: str = "en_core_web_sm"
+    spacy_model_en: str = "en_core_web_lg"
     spacy_model_es: str = "es_core_news_sm"
 
     # --- Parámetros de Hardware (Auto-ajustables según GPU detectada) ---
@@ -39,7 +44,6 @@ class ExperimentConfig:
     max_model_len: int = 32768
     max_num_seqs: int = 64
     embedding_batch_size: int = 64
-    spacy_n_process: int = 4
     dtype: str = "bfloat16"
 
     # --- Experimento 1: Particiones escalonadas de LongMemEval (en tokens) ---
@@ -53,22 +57,63 @@ class ExperimentConfig:
             2_500_000,
         ]
     )
+    exp1_num_runs: int = 3
+    # Calidad de respuesta sobre el índice de esta partición (se reindexa sin medir tiempo)
+    exp1_quality_partition: int = 1_000_000
+    exp1_quality_questions: int = 50
     e2_chunk_token_size: int = 1200
+    # El mismo solapamiento se aplica a E2GraphRAG y a LightRAG
+    chunk_overlap_token_size: int = 100
     e2_summary_tree_branching: int = 5
-    e2_summary_max_levels: int = 3
 
-    # --- Experimento 2: Evaluación Bi-temporal en LongMemEval (100 casos x 5 estados = 200 evaluaciones) ---
-    exp2_num_dialogues: int = 100
-    exp2_top_k_retrieval: int = 5
+    # --- Experimento 2: preguntas temporales de LongMemEval + escenarios bi-temporales sintéticos ---
+    # None usa todas las preguntas 'temporal-reasoning' y 'knowledge-update' no reservadas
+    exp2_max_longmemeval_cases: int | None = (
+        int(os.environ["PFC_EXP2_MAX_LME"]) if os.getenv("PFC_EXP2_MAX_LME") else None
+    )
+    exp2_num_synthetic_scenarios: int = 30
+    exp2_scenario_seed: int = 42
+    exp2_top_k_retrieval: int = 20
+    # Hechos candidatos de Graphiti antes de aplicar el filtro as-of
+    exp2_candidate_pool: int = 50
 
     # --- Rutas de Salida y Persistencia ---
     base_dir: Path = Path(os.getenv("PFC_BASE_DIR", "."))
     exp1_csv_path: str = "experimento1_resultados.csv"
+    exp1_quality_csv_path: str = "experimento1_calidad.csv"
     exp2_csv_path: str = "experimento2_resultados.csv"
+    stats_csv_path: str = "resumen_estadistico.csv"
+    judge_review_csv_path: str = "muestra_revision_juez.csv"
     run_manifest_path: str = "run_manifest.json"
     fig1_path: str = "fig1_latencia_indexacion.png"
     fig2_path: str = "fig2_bitemporal_recall_errores.png"
     google_drive_dir: Path = Path("/content/drive/MyDrive/PFC_RAG_Resultados")
+
+    # --- Piloto: para ajustar sin tocar los datos de la corrida final ---
+    # Usa otra semilla, preguntas reservadas y archivos propios (ver data_loader.py).
+    pilot: bool = os.getenv("PFC_PILOT") == "1"
+
+    def __post_init__(self) -> None:
+        if not self.pilot:
+            return
+        self.exp1_token_partitions = [100_000, 250_000]
+        self.exp1_num_runs = 1
+        self.exp1_quality_partition = 250_000
+        self.exp1_quality_questions = 5
+        self.exp2_num_synthetic_scenarios = 6
+        self.exp2_scenario_seed = 7
+        self.exp2_max_longmemeval_cases = 10
+        for name in (
+            "exp1_csv_path",
+            "exp1_quality_csv_path",
+            "exp2_csv_path",
+            "stats_csv_path",
+            "judge_review_csv_path",
+            "run_manifest_path",
+            "fig1_path",
+            "fig2_path",
+        ):
+            setattr(self, name, f"piloto_{getattr(self, name)}")
 
     def sync_to_google_drive(self, local_file: str | Path) -> bool:
         """
@@ -92,25 +137,29 @@ class ExperimentConfig:
             print(f"[DRIVE ADVERTENCIA] No se pudo sincronizar a Drive: {exc}")
         return False
 
-    def load_checkpoint_rows(self, filename: str) -> list:
+    def load_checkpoint_rows(self, filename: str, required_column: str) -> list:
         """
         Recupera filas ya calculadas de una corrida anterior para reanudar sin
         repetir trabajo. Prioriza la copia en Google Drive (sobrevive a la
         pérdida de la VM) y, si no existe, usa la copia local.
         Desactivar con la variable de entorno PFC_RESUME=0.
+        Un CSV sin `required_column` viene de una versión anterior del experimento:
+        mezclarlo invalidaría los resultados, así que la corrida se detiene.
         """
         if os.getenv("PFC_RESUME", "1") == "0":
             return []
-        try:
-            import pandas as pd
+        import pandas as pd
 
-            for candidate in (self.google_drive_dir / filename, self.base_dir / filename):
-                if candidate.exists() and candidate.stat().st_size > 0:
-                    rows = pd.read_csv(candidate).to_dict("records")
-                    print(f"[RESUME] {len(rows)} filas previas recuperadas desde: {candidate}")
-                    return rows
-        except Exception as exc:
-            print(f"[RESUME ADVERTENCIA] No se pudo leer el checkpoint '{filename}': {exc}")
+        for candidate in (self.google_drive_dir / filename, self.base_dir / filename):
+            if candidate.exists() and candidate.stat().st_size > 0:
+                df = pd.read_csv(candidate)
+                if required_column not in df.columns:
+                    raise RuntimeError(
+                        f"{candidate} viene de una versión anterior del experimento. "
+                        "Lanza la corrida con --fresh."
+                    )
+                print(f"[RESUME] {len(df)} filas previas recuperadas desde: {candidate}")
+                return df.to_dict("records")
         return []
 
     @property
@@ -128,8 +177,6 @@ class ExperimentConfig:
             import torch
 
             cpu_count = multiprocessing.cpu_count()
-            self.spacy_n_process = max(1, min(8, cpu_count - 2))
-
             if not torch.cuda.is_available():
                 self.dtype = "float32"
                 return "CPU (Sin acelerador GPU detectado)"

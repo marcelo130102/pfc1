@@ -1,7 +1,7 @@
 """
 Prueba corta de la VM de Colab antes de gastar GPU en el pipeline completo.
-Verifica con llamadas reales: dataset, servidor vLLM, LLM, embeddings, Juez LLM y
-extracción de LightRAG. Termina con código 1 si alguna verificación falla.
+Verifica con llamadas reales: dataset, servidor vLLM, LLM, embeddings, Juez LLM,
+aislamiento y consulta de LightRAG, E2GraphRAG y un escenario bi-temporal en Graphiti. Termina con código 1 si alguna verificación falla.
 
 Uso desde tu Mac (la sesión debe existir):
     colab new -s pfc --gpu A100 --high-mem
@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.colab_launch import PACKAGES, REPO_DIR, sync_local_code_to_vm
+from scripts.colab_launch import PACKAGES, REPO_DIR, ensure_neo4j_on_vm, sync_local_code_to_vm
 
 LOG_NAME = "smoke_test.log"
 PASS_MARKER = "SMOKE:PASS"
@@ -61,7 +61,7 @@ log_p = "{REPO_DIR}/{LOG_NAME}"
 lines = ""
 if os.path.exists(log_p):
     with open(log_p, "r", encoding="utf-8", errors="replace") as f:
-        lines = "".join(f.readlines()[-40:]).rstrip()
+        lines = "".join(f.readlines()[-60:]).rstrip()
 print("STATUS:RUNNING" if out else "STATUS:DONE")
 print(lines)
 """
@@ -116,42 +116,89 @@ async def check_embeddings(config, engine):
 
 
 async def check_judge(config, engine):
-    from src.data_loader import load_bitemporal_evaluation_cases
-    from src.exp2_bitemporal import BiTemporalLLMJudge
+    from src.evaluation import AnswerJudge
 
-    case = load_bitemporal_evaluation_cases(num_cases=1)[0]
-    judge = BiTemporalLLMJudge(engine)
-    trap = case.anachronistic_trap.split(" | ")[0]
-
-    correct = await judge.evaluate_response_async(case, f"El valor es {case.ground_truth}.")
-    wrong = await judge.evaluate_response_async(case, f"El valor es {trap}.")
-    for verdict in (correct, wrong):
-        if verdict["source"] != "llm":
-            raise RuntimeError(f"El Juez LLM no devolvió JSON válido: {verdict}")
-    if correct["temporal_recall"] != 1.0 or correct["anachronistic_error"] != 0:
+    judge = AnswerJudge(engine)
+    question = "What is the employer of Ana Torres?"
+    traps = ["Hospital Clinic", "ETH AI Center"]
+    correct = await judge.evaluate(question, "Max Planck Institute", "Ana works at the Max Planck Institute.", traps)
+    wrong = await judge.evaluate(question, "Max Planck Institute", "Ana works at Hospital Clinic.", traps)
+    if correct["correct"] is not True or correct["anachronistic"] is not False:
         raise RuntimeError(f"El juez rechazó la respuesta correcta: {correct}")
-    if wrong["temporal_recall"] != 0.0 or wrong["anachronistic_error"] != 1:
+    if wrong["correct"] is not False or wrong["anachronistic"] is not True:
         raise RuntimeError(f"El juez aceptó la respuesta anacrónica: {wrong}")
     return f"correcta={correct} | anacrónica={wrong}"
 
 
-async def check_lightrag(config, engine):
+def _sample_partition(engine, target_tokens):
     from src.data_loader import TokenPartition
-    from src.exp1_indexing import LightRAGBaselineIndexer
 
-    size_mb = len(LIGHTRAG_SAMPLE_DOC.encode("utf-8")) / (1024 * 1024)
-    partition = TokenPartition(
-        target_tokens=1_000,
+    return TokenPartition(
+        target_tokens=target_tokens,
         actual_tokens=engine.count_tokens(LIGHTRAG_SAMPLE_DOC),
-        size_mb=size_mb,
+        size_mb=len(LIGHTRAG_SAMPLE_DOC.encode("utf-8")) / (1024 * 1024),
         documents=[LIGHTRAG_SAMPLE_DOC],
     )
-    # El indexador lanza una excepción si el LLM falla o si el grafo queda vacío
-    metrics = await LightRAGBaselineIndexer(config, engine).index_partition_async(partition)
+
+
+async def check_lightrag(config, engine):
+    from src.exp1_indexing import LightRAGBaselineIndexer
+
+    indexer = LightRAGBaselineIndexer(config, engine)
+    # El indexador lanza una excepción si el LLM falla o si el grafo queda vacío.
+    # Dos particiones con el mismo documento: sin aislamiento, la segunda lo omitiría.
+    first = await indexer.index_partition_async(_sample_partition(engine, 1_000), run_id=1)
+    second = await indexer.index_partition_async(_sample_partition(engine, 2_000), run_id=1)
+    if second["llm_calls"] == 0:
+        raise RuntimeError("La segunda partición no llamó al LLM: el aislamiento falló.")
+    answer = await indexer.answer("Who received the Nobel Prize with Pierre Curie?")
+    await indexer.close()
+    return (
+        f"nodos={first['nodos_grafo']}/{second['nodos_grafo']} "
+        f"llamadas_llm={first['llm_calls']}/{second['llm_calls']} | respuesta={answer[:120]!r}"
+    )
+
+
+async def check_e2graphrag(config, engine):
+    from src.e2graphrag import E2GraphRAGIndexer
+
+    indexer = E2GraphRAGIndexer(config, engine)
+    metrics = await indexer.index_partition_async(_sample_partition(engine, 1_000))
+    if metrics["nodos_grafo"] == 0:
+        raise RuntimeError("spaCy no extrajo entidades del documento de prueba.")
+    question = "Who received the Nobel Prize with Pierre Curie?"
+    _, path = indexer.retrieve(question)
+    answer = await indexer.answer(question)
     return (
         f"nodos={metrics['nodos_grafo']} aristas={metrics['aristas_grafo']} "
-        f"llamadas_llm={metrics['llm_calls']}"
+        f"camino={path} | respuesta={answer[:120]!r}"
     )
+
+
+async def check_graphiti(config, engine):
+    from src.data_loader import load_bitemporal_evaluation_cases
+    from src.exp2_bitemporal import GraphitiMemory
+
+    cases = load_bitemporal_evaluation_cases(num_scenarios=1)
+    memory = GraphitiMemory(config, engine)
+    lines = []
+    try:
+        await memory.open(cases[0].group_id)
+        await memory.ingest(cases[0].episodes)
+        edges = await memory.graphiti.search(
+            cases[0].question, group_ids=[memory.group_id], num_results=config.exp2_candidate_pool
+        )
+        if not edges:
+            raise RuntimeError("Graphiti no extrajo ningún hecho del escenario.")
+        for edge in edges:
+            lines.append(f"{edge.fact} | valid={edge.valid_at} invalid={edge.invalid_at} expired={edge.expired_at}")
+        for case in cases:
+            answer, facts = await memory.answer(case, as_of=True)
+            lines.append(f"{case.category}: oro={case.ground_truth!r} hechos={len(facts)} respuesta={answer[:120]!r}")
+    finally:
+        await memory.close()
+    # Se muestra sin exigir acierto: lo que responda Graphiti es justamente lo que se mide
+    return "\n  " + "\n  ".join(lines)
 
 
 async def run_checks() -> int:
@@ -169,7 +216,9 @@ async def run_checks() -> int:
         ("Llamada real al LLM", check_llm, True),
         ("Embeddings bge-m3", check_embeddings, False),
         ("Juez LLM", check_judge, True),
-        ("Extracción LightRAG", check_lightrag, True),
+        ("LightRAG: aislamiento y consulta", check_lightrag, True),
+        ("E2GraphRAG: índice y consulta", check_e2graphrag, True),
+        ("Graphiti: escenario bi-temporal", check_graphiti, True),
     ]
 
     results = {}
@@ -200,6 +249,8 @@ async def run_checks() -> int:
 
 def run_checks_on_vm() -> int:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PACKAGES], check=True)
+    subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_lg", "-q"], check=True)
+    ensure_neo4j_on_vm()
     # Un solo event loop, igual que run_all_experiments.py: el cliente async del motor
     # y los workers de LightRAG quedan ligados al loop en el que se crean.
     return asyncio.run(run_checks())

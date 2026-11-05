@@ -5,7 +5,7 @@ Permite lanzar el pipeline experimental completo del PFC de una sola vez:
 2. Experimento 1: Eficiencia en Indexación (E2GraphRAG vs LightRAG).
 3. Experimento 2: Consistencia Bi-temporal (Zep/Graphiti vs LightRAG) + Juez LLM.
 4. Generación de Figuras Publication-Ready (300 DPI).
-5. Sincronización automática de CSVs y PDFs/PNGs a Google Drive.
+5. Análisis estadístico y sincronización automática de CSVs y PDFs/PNGs a Google Drive.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from src.analysis import run_analysis
 from src.config import ExperimentConfig
 from src.data_loader import DATASET_PROVENANCE
 from src.exp1_indexing import run_experiment_1
@@ -50,15 +51,19 @@ def write_run_manifest(
 
     manifest = {
         "status": status,
+        "pilot": config.pilot,
         "started_at_utc": started_at,
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "hardware": hardware,
         "llm_model": config.llm_model_id,
         "embedding_model": config.embedding_model_id,
+        "graph_backend": f"neo4j {os.getenv('PFC_NEO4J_VERSION', 'desconocida')}",
         "exp1_token_partitions": config.exp1_token_partitions,
-        "exp1_dataset": dict(DATASET_PROVENANCE),
-        "exp2_num_cases": config.exp2_num_dialogues,
-        "exp2_dataset": "escenarios sintéticos definidos en src/data_loader.py",
+        "exp1_num_runs": config.exp1_num_runs,
+        "dataset": dict(DATASET_PROVENANCE),
+        "exp2_max_longmemeval_cases": config.exp2_max_longmemeval_cases,
+        "exp2_synthetic_scenarios": config.exp2_num_synthetic_scenarios,
+        "exp2_scenario_seed": config.exp2_scenario_seed,
         "resume_enabled": os.getenv("PFC_RESUME", "1") != "0",
         "python": platform.python_version(),
         "packages": packages,
@@ -89,7 +94,7 @@ async def main() -> None:
     # 2. Inicialización de Servidor vLLM
     print("\n[2/5] Verificando / Levantando servidor vLLM en localhost:8000...")
     if not engine.is_server_healthy():
-        engine.start_vllm_server(timeout_seconds=300)
+        engine.start_vllm_server(timeout_seconds=900)
     else:
         print("[OK] Servidor vLLM ya se encuentra activo y saludable.")
     print(f"[INFO] Modelo LLM activo: {config.llm_model_id}")
@@ -113,6 +118,7 @@ async def main() -> None:
     print("\n" + "=" * 75)
     print("[5/5] GENERANDO FIGURAS ACADÉMICAS PUBLICATION-READY (300 DPI)")
     print("=" * 75)
+    run_analysis(config=config)
     fig1, fig2 = generate_all_figures(config=config)
     print(f"[OK] Figuras generadas:")
     print(f"     - Figura 1: {fig1.resolve()}")

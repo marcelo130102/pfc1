@@ -23,10 +23,14 @@ smoke_test.log
 
 # Salidas de corrida en la raíz: los resultados válidos se versionan en results/
 /experimento*_resultados.csv
+/experimento1_calidad.csv
+/resumen_estadistico.csv
+/muestra_revision_juez.csv
 /fig[12]_*.png
 /fig[12]_*.pdf
 /experiments.log
 /run_manifest.json
+/piloto_*
 
 # Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
 .ipynb_checkpoints/

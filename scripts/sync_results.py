@@ -12,17 +12,23 @@ import argparse
 import subprocess
 from pathlib import Path
 
-FILES_TO_SYNC = [
+RESULT_FILES = [
     "experimento1_resultados.csv",
+    "experimento1_calidad.csv",
     "experimento2_resultados.csv",
+    "resumen_estadistico.csv",
+    "muestra_revision_juez.csv",
     "fig1_latencia_indexacion.png",
     "fig1_latencia_indexacion.pdf",
     "fig2_bitemporal_recall_errores.png",
     "fig2_bitemporal_recall_errores.pdf",
-    "experiments.log",
     "run_manifest.json",
-    "vllm_server.log",
 ]
+FILES_TO_SYNC = (
+    RESULT_FILES
+    + [f"piloto_{name}" for name in RESULT_FILES]
+    + ["experiments.log", "vllm_server.log"]
+)
 
 REMOTE_DIRS = [
     "/content/pfc1",

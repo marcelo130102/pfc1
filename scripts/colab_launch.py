@@ -6,19 +6,23 @@ Uso desde tu Mac:
     colab new -s pfc --gpu A100 --high-mem
     colab drivemount -s pfc
 
-    # Verificar LLM, LightRAG y dataset antes de gastar GPU en todo el pipeline:
+    # 2. Verificar LLM, LightRAG, Graphiti y dataset antes de gastar GPU en todo el pipeline:
     python3 scripts/colab_smoke_test.py -s pfc
 
-    # 2A. Ampliar experimentos (conserva 100k-1M en Exp1, calcula 1.5M y 2.5M + 100 casos de 5 saltos en Exp2):
-    python3 scripts/colab_launch.py -s pfc --expand
+    # 3. Piloto para ajustar sin tocar los datos finales (archivos piloto_*):
+    python3 scripts/colab_launch.py -s pfc --pilot
 
-    # 2B. Recalcular absolutamente todo desde cero (100k a 2.5M + 100 casos de Exp2):
+    # 4. Con el diseño congelado en un commit, corrida final (borra sus checkpoints):
     python3 scripts/colab_launch.py -s pfc --fresh
+
+    # Si la VM se pierde a mitad de camino, reanudar desde los checkpoints de Drive:
+    python3 scripts/colab_launch.py -s pfc
 """
 
 import argparse
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -28,10 +32,15 @@ REPO_URL = "https://github.com/marcelo130102/pfc1.git"
 REPO_DIR = "/content/pfc1"
 DRIVE_DIR = "/content/drive/MyDrive/PFC_RAG_Resultados"
 POLL_SECONDS = 30
+NEO4J_VERSION = "5.26.21"
+NEO4J_HOME = f"/content/neo4j-community-{NEO4J_VERSION}"
+NEO4J_JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
+# Neo4j solo escucha en localhost de la VM: esta contraseña no protege nada expuesto
+NEO4J_PASSWORD = "pfc-local-neo4j"
 REPORT_EVERY_SECONDS = 120
 
 PACKAGES = [
-    "lightrag-hku", "spacy", "vllm", "graphiti-core", "datasets", "pandas",
+    "lightrag-hku==1.5.7", "spacy", "vllm", "graphiti-core==0.31.2", "datasets", "pandas",
     "networkx", "sentence-transformers", "FlagEmbedding", "tiktoken", "openai",
     "matplotlib", "seaborn", "tqdm", "nest_asyncio", "psutil",
 ]
@@ -58,23 +67,49 @@ def tail(path, n=5):
         return "(log aún vacío)"
 
 
-def prepare_repo_on_colab_vm() -> None:
-    """Clona o actualiza el repositorio base en /content/pfc1 dentro de la VM."""
-    if os.path.exists(REPO_DIR):
-        subprocess.run(["git", "-C", REPO_DIR, "pull"], check=False)
-    else:
-        run(["git", "clone", REPO_URL, REPO_DIR])
-    os.makedirs(os.path.join(REPO_DIR, "src"), exist_ok=True)
+def ensure_neo4j_on_vm() -> None:
+    """Instala y arranca Neo4j Community en la VM si aún no está escuchando."""
+
+    def _bolt_is_open() -> bool:
+        with socket.socket() as sock:
+            sock.settimeout(2)
+            return sock.connect_ex(("127.0.0.1", 7687)) == 0
+
+    if _bolt_is_open():
+        print("[OK] Neo4j ya está activo en la VM.", flush=True)
+        return
+
+    run(["apt-get", "install", "-y", "-q", "openjdk-17-jre-headless"])
+    env = {**os.environ, "JAVA_HOME": NEO4J_JAVA_HOME}
+    if not os.path.isdir(NEO4J_HOME):
+        tarball = f"{NEO4J_HOME}.tar.gz"
+        run(["curl", "-fsSL", "-o", tarball,
+             f"https://dist.neo4j.org/neo4j-community-{NEO4J_VERSION}-unix.tar.gz"])
+        run(["tar", "xzf", tarball, "-C", os.path.dirname(NEO4J_HOME)])
+        run([f"{NEO4J_HOME}/bin/neo4j-admin", "dbms", "set-initial-password", NEO4J_PASSWORD], env=env)
+        with open(f"{NEO4J_HOME}/conf/neo4j.conf", "a", encoding="utf-8") as conf:
+            conf.write(
+                "\ndbms.usage_report.enabled=false\n"
+                "server.memory.heap.initial_size=2g\n"
+                "server.memory.heap.max_size=8g\n"
+                "server.memory.pagecache.size=4g\n"
+            )
+    run([f"{NEO4J_HOME}/bin/neo4j", "start"], env=env)
+
+    for _ in range(60):
+        if _bolt_is_open():
+            print(f"[OK] Neo4j {NEO4J_VERSION} activo en la VM.", flush=True)
+            return
+        time.sleep(2)
+    raise RuntimeError(f"Neo4j no arrancó. Revisa {NEO4J_HOME}/logs/neo4j.log")
 
 
 def start_on_colab_vm() -> None:
     """
     Se ejecuta DENTRO de la VM de Colab:
-    Instala dependencias, gestiona los checkpoints según --fresh o --expand,
-    y lanza `run_all_experiments.py` en segundo plano.
+    Instala dependencias, gestiona los checkpoints según --fresh y lanza
+    `run_all_experiments.py` en segundo plano. El código ya lo subió el Mac.
     """
-    prepare_repo_on_colab_vm()
-
     drive_ok = os.path.isdir("/content/drive/MyDrive")
     if not drive_ok:
         print("[AVISO] Google Drive NO está montado. Ejecuta antes: colab drivemount -s pfc", flush=True)
@@ -82,11 +117,12 @@ def start_on_colab_vm() -> None:
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "experiments.log")
 
-    mode_fresh = os.environ.get("PFC_FRESH") == "1"
-    mode_expand = os.environ.get("PFC_EXPAND") == "1"
+    # El piloto siempre empieza de cero, pero solo borra sus propios archivos
+    pilot = os.environ.get("PFC_PILOT") == "1"
+    mode_fresh = os.environ.get("PFC_FRESH") == "1" or pilot
 
     pid = running_pid()
-    if pid and (mode_fresh or mode_expand):
+    if pid and mode_fresh:
         print(f"[INFO] Deteniendo corrida anterior (PID {pid})...", flush=True)
         subprocess.run(["kill", "-9", str(pid)], check=False)
         time.sleep(2)
@@ -96,30 +132,28 @@ def start_on_colab_vm() -> None:
         print(f"[INFO] El pipeline ya estaba corriendo en la VM (PID {pid}).", flush=True)
     else:
         run([sys.executable, "-m", "pip", "install", "-q", *PACKAGES])
-        run([sys.executable, "-m", "spacy", "download", "en_core_web_sm", "-q"])
-        run([sys.executable, "-m", "spacy", "download", "es_core_news_sm", "-q"])
+        run([sys.executable, "-m", "spacy", "download", "en_core_web_lg", "-q"])
+        ensure_neo4j_on_vm()
 
         env = os.environ.copy()
+        env["PFC_NEO4J_VERSION"] = NEO4J_VERSION
         if mode_fresh:
             env["PFC_RESUME"] = "0"
-            for old_csv in ("experimento1_resultados.csv", "experimento2_resultados.csv"):
+            for old_output in (
+                "experimento1_resultados.csv",
+                "experimento1_calidad.csv",
+                "experimento2_resultados.csv",
+                "resumen_estadistico.csv",
+                "muestra_revision_juez.csv",
+                "run_manifest.json",
+            ):
                 for folder in (DRIVE_DIR, REPO_DIR):
-                    p = os.path.join(folder, old_csv)
+                    p = os.path.join(folder, f"piloto_{old_output}" if pilot else old_output)
                     if os.path.exists(p):
                         os.remove(p)
                         print(f"[FRESH] Checkpoint previo eliminado: {p}", flush=True)
-            if os.path.exists(log_path):
+            if os.path.exists(log_path) and not pilot:
                 os.remove(log_path)
-        elif mode_expand:
-            # En modo --expand conservamos experimento1_resultados.csv (para reutilizar 100k..1M
-            # y calcular sólo 1.5M y 2.5M) y limpiamos experimento2_resultados.csv para correr
-            # los 100 casos ampliados de 5 saltos temporales desde cero.
-            env["PFC_RESUME"] = "1"
-            for folder in (DRIVE_DIR, REPO_DIR):
-                p2 = os.path.join(folder, "experimento2_resultados.csv")
-                if os.path.exists(p2):
-                    os.remove(p2)
-                    print(f"[EXPAND] Reiniciando Experimento 2 a 100 casos de 5 saltos: eliminado {p2}", flush=True)
 
         log_fh = open(log_path, "a", encoding="utf-8")
         proc = subprocess.Popen(
@@ -180,9 +214,9 @@ else:
 
 def sync_local_code_to_vm(session: str, repo_root: Path) -> None:
     """
-    Sube los módulos locales (`src/*.py`, `run_all_experiments.py` y `experimento1_resultados.csv`
-    si existe) desde tu Mac hacia `/content/pfc1` en la VM para garantizar que corra siempre
-    la última versión ampliada sin depender de `git push`.
+    Sube los módulos locales (`src/*.py`, `scripts/*.py` y `run_all_experiments.py`) desde tu
+    Mac hacia `/content/pfc1` en la VM para garantizar que corra siempre la última versión
+    sin depender de `git push`.
     """
     init_snippet = (
         "import os, subprocess\n"
@@ -203,23 +237,12 @@ def sync_local_code_to_vm(session: str, repo_root: Path) -> None:
             f"No se pudo preparar {REPO_DIR} en la VM: {init_res.stderr.strip()}"
         )
 
-    files_to_upload = [
-        (repo_root / "run_all_experiments.py", f"{REPO_DIR}/run_all_experiments.py"),
-        (repo_root / "src" / "__init__.py", f"{REPO_DIR}/src/__init__.py"),
-        (repo_root / "src" / "config.py", f"{REPO_DIR}/src/config.py"),
-        (repo_root / "src" / "inference_setup.py", f"{REPO_DIR}/src/inference_setup.py"),
-        (repo_root / "src" / "data_loader.py", f"{REPO_DIR}/src/data_loader.py"),
-        (repo_root / "src" / "exp1_indexing.py", f"{REPO_DIR}/src/exp1_indexing.py"),
-        (repo_root / "src" / "exp2_bitemporal.py", f"{REPO_DIR}/src/exp2_bitemporal.py"),
-        (repo_root / "src" / "visualization.py", f"{REPO_DIR}/src/visualization.py"),
-        (repo_root / "scripts" / "colab_launch.py", f"{REPO_DIR}/scripts/colab_launch.py"),
-        (repo_root / "scripts" / "colab_smoke_test.py", f"{REPO_DIR}/scripts/colab_smoke_test.py"),
-    ]
-    exp1_local = repo_root / "experimento1_resultados.csv"
-    if exp1_local.exists():
-        files_to_upload.append((exp1_local, f"{REPO_DIR}/experimento1_resultados.csv"))
+    files_to_upload = [(repo_root / "run_all_experiments.py", f"{REPO_DIR}/run_all_experiments.py")]
+    for folder in ("src", "scripts"):
+        for local_f in sorted((repo_root / folder).glob("*.py")):
+            files_to_upload.append((local_f, f"{REPO_DIR}/{folder}/{local_f.name}"))
 
-    print("[SYNC] Subiendo código ampliado desde tu Mac a la VM de Colab...", flush=True)
+    print("[SYNC] Subiendo código desde tu Mac a la VM de Colab...", flush=True)
     for local_f, remote_f in files_to_upload:
         res = subprocess.run(
             ["colab", "upload", "-s", session, str(local_f), remote_f],
@@ -246,14 +269,14 @@ def run_from_mac_laptop() -> None:
     )
     parser.add_argument("--session", "-s", default="pfc", help="Nombre de la sesión de Colab (default: pfc)")
     parser.add_argument(
-        "--expand",
+        "--pilot",
         action="store_true",
-        help="Conserva 100k-1M de Exp1, calcula las nuevas particiones 1.5M y 2.5M, y corre los 100 casos de 5 saltos de Exp2.",
+        help="Corrida corta con otra semilla, preguntas reservadas y archivos piloto_*.",
     )
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Elimina todos los checkpoints previos y recalcula de 100k a 2.5M + 100 casos de Exp2 desde cero.",
+        help="Elimina todos los checkpoints previos y recalcula los dos experimentos desde cero.",
     )
     args = parser.parse_args()
 
@@ -282,18 +305,22 @@ def run_from_mac_laptop() -> None:
             "import os\n"
             "os.environ['PFC_MAC_MANAGED'] = '1'\n"
             f"os.environ['PFC_FRESH'] = '{'1' if args.fresh else '0'}'\n"
-            f"os.environ['PFC_EXPAND'] = '{'1' if args.expand else '0'}'\n"
+            f"os.environ['PFC_PILOT'] = '{'1' if args.pilot else '0'}'\n"
         )
         full_code = header + script_path.read_text(encoding="utf-8")
 
-        print(f"[COLAB] Inicializando pipeline ampliado en la sesión '{args.session}'...", flush=True)
-        subprocess.run(
-            ["colab", "exec", "-s", args.session],
+        print(f"[COLAB] Inicializando pipeline en la sesión '{args.session}'...", flush=True)
+        # El tiempo de espera cubre pip install: si venciera antes de lanzar el pipeline,
+        # el monitoreo creería que ya terminó.
+        started = subprocess.run(
+            ["colab", "exec", "-s", args.session, "--timeout", "1800"],
             input=full_code,
             text=True,
             cwd=str(repo_root),
             check=False,
         )
+        if started.returncode != 0:
+            raise RuntimeError("No se pudo lanzar el pipeline en la VM.")
 
         # Bucle de monitoreo mediante llamadas cortas (mantiene viva la VM sin TimeoutError)
         t0 = time.time()
