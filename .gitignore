@@ -21,6 +21,13 @@ models/
 vllm_server.log
 smoke_test.log
 
+# Salidas de corrida en la raíz: los resultados válidos se versionan en results/
+/experimento*_resultados.csv
+/fig[12]_*.png
+/fig[12]_*.pdf
+/experiments.log
+/run_manifest.json
+
 # Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
 .ipynb_checkpoints/
 .DS_Store
