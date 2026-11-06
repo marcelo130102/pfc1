@@ -47,14 +47,14 @@ class ExperimentConfig:
     dtype: str = "bfloat16"
 
     # --- Experimento 1: Particiones escalonadas de LongMemEval (en tokens) ---
+    # Hasta 1M por presupuesto: con 3 corridas, LightRAG tarda ~936 s/MB en una A100 y las
+    # particiones de 1.5M y 2.5M duplicarían el costo de la corrida final (ver piloto)
     exp1_token_partitions: List[int] = field(
         default_factory=lambda: [
             100_000,
             250_000,
             500_000,
             1_000_000,
-            1_500_000,
-            2_500_000,
         ]
     )
     exp1_num_runs: int = 3
@@ -76,6 +76,8 @@ class ExperimentConfig:
     exp2_top_k_retrieval: int = 20
     # Hechos candidatos de Graphiti antes de aplicar el filtro as-of
     exp2_candidate_pool: int = 50
+    # Grupos de casos que Graphiti procesa a la vez (el Experimento 2 no mide tiempos)
+    exp2_parallel_groups: int = 4
 
     # --- Rutas de Salida y Persistencia ---
     base_dir: Path = Path(os.getenv("PFC_BASE_DIR", "."))

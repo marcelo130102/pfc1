@@ -2,9 +2,11 @@
 Análisis estadístico de los resultados:
 - Experimento 1: media y desviación estándar por partición, y calidad de respuesta.
 - Experimento 2: accuracy con intervalo de Wilson, comparaciones planificadas con McNemar y
-  ajuste de Holm, tasas de error y etapa en que falló cada caso sintético.
+  ajuste de Holm, tasas de error, etapa en que falló cada caso sintético y calidad de la extracción.
 - Muestra aleatoria de veredictos para revisar el Juez LLM a mano.
-Cada fila indica si pertenece al análisis principal o al exploratorio.
+- Sensibilidad: accuracy sobre los casos que todos los sistemas evaluaron y McNemar contando
+  los errores como fallos.
+Cada fila indica si pertenece al análisis principal, al exploratorio o al de sensibilidad.
 """
 
 from __future__ import annotations
@@ -170,8 +172,40 @@ def _coverage_rows(
     return rows
 
 
+def _sensitivity_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Comprueba si las conclusiones dependen de los casos que algún sistema no pudo evaluar:
+    accuracy solo sobre los casos que todos evaluaron, y McNemar planificado contando los
+    errores y la falta de veredicto como fallos.
+    """
+    rows: List[Dict[str, Any]] = []
+    evaluated = df["juez_fuente"] == "llm"
+    df = df.assign(acierto=_as_bool(df["correcto"]) & evaluated, clave_par=df["case_id"])
+    for source, group in df.groupby("fuente_dataset", sort=False):
+        methods_per_case = group[evaluated.loc[group.index]].groupby("case_id")["metodo"].nunique()
+        common_cases = methods_per_case[methods_per_case == group["metodo"].nunique()].index
+        common = group[group["case_id"].isin(common_cases)]
+        accuracy = _accuracy_rows(common, ["fuente_dataset"], "exp2_sensibilidad", "sensibilidad")
+        for row in accuracy:
+            row["metrica"] = "accuracy_casos_comunes"
+        rows += accuracy
+
+        planned = [_mcnemar_row(group, *pair) for pair in PLANNED_COMPARISONS[source]]
+        planned = [row for row in planned if row]
+        for row, adjusted in zip(planned, holm_adjust([row["mcnemar_p"] for row in planned])):
+            row.update(
+                experimento="exp2_sensibilidad",
+                analisis="sensibilidad",
+                grupo=source,
+                metrica="mcnemar_errores_como_fallo",
+                mcnemar_p_holm=adjusted,
+            )
+        rows += planned
+    return rows
+
+
 def _failure_stage_rows(synthetic: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Reparte los fallos de Graphiti entre extracción, recuperación y respuesta."""
+    """Reparte los fallos de Graphiti entre extracción, fecha, recuperación y respuesta."""
     rows: List[Dict[str, Any]] = []
     graphiti = synthetic[synthetic["metodo"] != LIGHTRAG_LABEL]
     for metodo, group in graphiti.groupby("metodo", sort=False):
@@ -180,9 +214,12 @@ def _failure_stage_rows(synthetic: pd.DataFrame) -> List[Dict[str, Any]]:
             continue
         in_graph = _as_bool(failures["oro_en_grafo"])
         in_facts = _as_bool(failures["oro_en_hechos"])
+        # Solo la capa as-of descarta hechos por su fecha
+        wrong_date = ~_as_bool(failures["fecha_oro_correcta"]) & (metodo == ZEP_ASOF_LABEL)
         stages = {
             "fallo_extraccion": ~in_graph,
-            "fallo_recuperacion": in_graph & ~in_facts,
+            "fallo_fecha_extraida": in_graph & ~in_facts & wrong_date,
+            "fallo_recuperacion": in_graph & ~in_facts & ~wrong_date,
             "fallo_respuesta": in_facts,
         }
         for stage, mask in stages.items():
@@ -197,6 +234,46 @@ def _failure_stage_rows(synthetic: pd.DataFrame) -> List[Dict[str, Any]]:
                     "valor": mask.mean(),
                 }
             )
+    return rows
+
+
+def _extraction_quality_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Calidad de lo que extrajo Graphiti con este LLM, para no atribuirla a la arquitectura.
+    Se calcula sobre un brazo porque ambos comparten el mismo grafo.
+    """
+    rows: List[Dict[str, Any]] = []
+    asof = df[df["metodo"] == ZEP_ASOF_LABEL]
+    for source, group in asof.groupby("fuente_dataset", sort=False):
+        by_group = group.groupby("escenario")["proporcion_hechos_no_latinos"].first().dropna()
+        rows.append(
+            {
+                "experimento": "exp2_extraccion",
+                "analisis": "exploratorio",
+                "grupo": source,
+                "metodo": "Graphiti",
+                "metrica": "proporcion_hechos_no_latinos",
+                "n": len(by_group),
+                "valor": by_group.mean(),
+            }
+        )
+    synthetic = asof[asof["fuente_dataset"] == "sintetico"]
+    for category, group in synthetic.groupby("categoria_temporal", sort=False):
+        correct = int(_as_bool(group["fecha_oro_correcta"]).sum())
+        low, high = wilson_interval(correct, len(group))
+        rows.append(
+            {
+                "experimento": "exp2_extraccion",
+                "analisis": "exploratorio",
+                "grupo": f"sintetico / {category}",
+                "metodo": "Graphiti",
+                "metrica": "tasa_fecha_oro_correcta",
+                "n": len(group),
+                "valor": correct / len(group),
+                "ic95_bajo": low,
+                "ic95_alto": high,
+            }
+        )
     return rows
 
 
@@ -241,6 +318,7 @@ def summarize_exp1_quality(csv_path: Path) -> List[Dict[str, Any]]:
 def summarize_exp2(csv_path: Path) -> List[Dict[str, Any]]:
     df = pd.read_csv(csv_path)
     rows = _coverage_rows(df, ["fuente_dataset", "metodo"], "exp2_cobertura")
+    rows += _sensitivity_rows(df)
 
     df = df[df["juez_fuente"] == "llm"].copy()
     df["acierto"] = _as_bool(df["correcto"])
@@ -258,6 +336,7 @@ def summarize_exp2(csv_path: Path) -> List[Dict[str, Any]]:
     for source, group in df.groupby("fuente_dataset", sort=False):
         rows += _comparison_rows(group, source, "exp2")
     rows += _category_comparison_rows(df)
+    rows += _extraction_quality_rows(df)
 
     synthetic = df[df["fuente_dataset"] == "sintetico"].copy()
     if len(synthetic):

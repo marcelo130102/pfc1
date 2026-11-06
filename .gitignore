@@ -31,6 +31,7 @@ smoke_test.log
 /experiments.log
 /run_manifest.json
 /piloto_*
+/invalidos_*
 
 # Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
 .ipynb_checkpoints/

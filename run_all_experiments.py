@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -64,6 +65,7 @@ def write_run_manifest(
         "exp2_max_longmemeval_cases": config.exp2_max_longmemeval_cases,
         "exp2_synthetic_scenarios": config.exp2_num_synthetic_scenarios,
         "exp2_scenario_seed": config.exp2_scenario_seed,
+        "exp2_parallel_groups": config.exp2_parallel_groups,
         "resume_enabled": os.getenv("PFC_RESUME", "1") != "0",
         "python": platform.python_version(),
         "packages": packages,
@@ -104,8 +106,19 @@ async def main() -> None:
     print("\n" + "=" * 75)
     print("[3/5] INICIANDO EXPERIMENTO 1: EFICIENCIA EN INDEXACIÓN")
     print("=" * 75)
-    df_exp1 = await run_experiment_1(config=config, engine=engine)
-    print(f"[OK] Experimento 1 completado con éxito ({len(df_exp1)} registros guardados).")
+    if os.getenv("PFC_SKIP_EXP1") == "1":
+        # Solo en pilotos: reutiliza el Experimento 1 de un piloto anterior guardado en Drive
+        if not config.pilot:
+            raise RuntimeError("PFC_SKIP_EXP1 solo se permite en el piloto.")
+        for name in (config.exp1_csv_path, config.exp1_quality_csv_path):
+            source = config.google_drive_dir / name
+            if not source.exists():
+                raise RuntimeError(f"PFC_SKIP_EXP1 necesita {source} de un piloto anterior.")
+            shutil.copy2(source, config.base_dir / name)
+        print("[OK] Experimento 1 omitido: se reutilizan sus CSV del piloto anterior.")
+    else:
+        df_exp1 = await run_experiment_1(config=config, engine=engine)
+        print(f"[OK] Experimento 1 completado con éxito ({len(df_exp1)} registros guardados).")
 
     # 4. Experimento 2: Consistencia Bi-temporal + Juez LLM
     print("\n" + "=" * 75)

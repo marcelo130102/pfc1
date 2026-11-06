@@ -100,7 +100,8 @@ def wilson_interval(successes: int, total: int, z: float = 1.96) -> Tuple[float,
     denom = 1 + z**2 / total
     center = (p + z**2 / (2 * total)) / denom
     margin = z * math.sqrt(p * (1 - p) / total + z**2 / (4 * total**2)) / denom
-    return (max(0.0, center - margin), min(1.0, center + margin))
+    # Con p = 0 o p = 1, el redondeo puede dejar p apenas fuera del intervalo
+    return (min(p, max(0.0, center - margin)), max(p, min(1.0, center + margin)))
 
 
 def mcnemar_exact(only_a_correct: int, only_b_correct: int) -> float:

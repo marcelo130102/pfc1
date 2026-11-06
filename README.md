@@ -15,7 +15,7 @@ Diseñado para ejecutarse con **$0 de costo en APIs** en **Google Colab Pro / Go
 | **Baseline de Control** | **LightRAG** (`lightrag-hku`) | Extracción generativa LLM de entidades/relaciones + grafo estático | Línea base estándar en GraphRAG |
 | **Técnica 1 (P1)** | **E²GraphRAG** ([portado del repo oficial](https://github.com/YiboZhao624/E-2GraphRAG), MIT, en `src/e2graphrag.py`) | Extracción NER en CPU (`SpaCy`) + Grafo de Coocurrencia Oracional (`NetworkX`) + Árbol Jerárquico de Resúmenes en GPU | Cuello de botella computacional y alto consumo de tokens GPU durante la indexación |
 | **Técnica 2 (P2)** | **Zep / Graphiti** (`graphiti-core`) | Modelo Bi-temporal $(t_{VT} \times t_{TT})$ con intervalos de validez `[valid_at, invalid_at)` e invalidación dinámica de aristas contradictorias | Alucinaciones cronológicas y mezcla de hechos obsoletos ante actualizaciones de conocimiento |
-| **Dataset** | **LongMemEval** (`xiaowu0162/longmemeval-cleaned`) | Particiones de `100k` a `2.5M` tokens y preguntas `temporal-reasoning` y `knowledge-update`, más 30 escenarios bi-temporales **sintéticos** con hechos tardíos y correcciones retroactivas | Evaluación de escalabilidad y razonamiento temporal |
+| **Dataset** | **LongMemEval** (`xiaowu0162/longmemeval-cleaned`) | Particiones de `100k` a `1M` tokens y preguntas `temporal-reasoning` y `knowledge-update`, más 30 escenarios bi-temporales **sintéticos** con hechos tardíos y correcciones retroactivas | Evaluación de escalabilidad y razonamiento temporal |
 | **Motor Local** | **vLLM / Ollama + BGE-M3** | `Qwen/Qwen2.5-7B-Instruct` en `localhost:8000` + `BAAI/bge-m3` | Inferencia reproducible sin costo de API |
 
 ---

@@ -1,6 +1,6 @@
 """
 BLOQUE 2: Pipeline del Experimento 1 (Eficiencia en Indexación: E2GraphRAG vs LightRAG).
-Evalúa en particiones escalonadas de LongMemEval (100k a 2.5M tokens), con varias corridas:
+Evalúa en particiones escalonadas de LongMemEval (100k a 1M tokens), con varias corridas:
 1. LightRAG (Baseline estático generativo): Extracción de entidades y relaciones con LLM en GPU.
 2. E2GraphRAG (Técnica 1 - Problema P1):
    - Portado del repositorio oficial en src/e2graphrag.py: grafo de coocurrencia en CPU con

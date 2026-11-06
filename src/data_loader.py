@@ -1,7 +1,7 @@
 """
 Módulo de carga y preparación de datos para los Experimentos 1 y 2.
 - Experimento 1: particiones escalonadas de sesiones reales de LongMemEval por número de
-  tokens (100k a 2.5M), y preguntas de LongMemEval para medir la calidad de respuesta.
+  tokens (100k a 1M), y preguntas de LongMemEval para medir la calidad de respuesta.
 - Experimento 2: preguntas 'temporal-reasoning' y 'knowledge-update' de LongMemEval, más
   escenarios bi-temporales SINTÉTICOS con hechos tardíos y correcciones retroactivas
   (LongMemEval no distingue tiempo de validez y tiempo de transacción).
@@ -74,6 +74,8 @@ class EvalCase:
     query_vt: Optional[datetime] = None
     query_tt: Optional[datetime] = None
     anachronistic_traps: List[str] = field(default_factory=list)
+    # Solo en escenarios sintéticos: desde cuándo es válida la respuesta oro
+    expected_valid_from: Optional[datetime] = None
 
 
 @dataclass
@@ -155,7 +157,7 @@ def load_longmemeval_partitions(
     chunk_token_size: int = 1200,
 ) -> List[TokenPartition]:
     """
-    Construye las particiones escalonadas (100k, 250k, 500k, 1M, 1.5M, 2.5M tokens)
+    Construye las particiones escalonadas (100k, 250k, 500k y 1M tokens)
     para el Experimento 1, agrupadas en documentos de ~chunk_token_size tokens.
     Calcula el peso exacto en Megabytes (MB) de cada partición.
     """
@@ -377,15 +379,15 @@ def load_bitemporal_evaluation_cases(
                 t4,
             ),
         ]
-        # (categoría, tiempo de validez, tiempo de transacción, respuesta, trampas)
+        # (categoría, tiempo de validez, tiempo de transacción, respuesta, inicio de su validez, trampas)
         windows = [
-            ("current-state", now, now, value_c, [value_a, value_b]),
-            ("tt-before-late-arrival", between, t3 - timedelta(days=1), value_a, [value_b, value_c]),
-            ("tt-after-late-arrival", between, t3 + timedelta(days=30), value_b, [value_a, value_c]),
-            ("retroactive-correction", between, now, value_c, [value_a, value_b]),
-            ("pre-change-audit", t2 - timedelta(days=30), now, value_a, [value_b, value_c]),
+            ("current-state", now, now, value_c, t2, [value_a, value_b]),
+            ("tt-before-late-arrival", between, t3 - timedelta(days=1), value_a, t1, [value_b, value_c]),
+            ("tt-after-late-arrival", between, t3 + timedelta(days=30), value_b, t2, [value_a, value_c]),
+            ("retroactive-correction", between, now, value_c, t2, [value_a, value_b]),
+            ("pre-change-audit", t2 - timedelta(days=30), now, value_a, t1, [value_b, value_c]),
         ]
-        for category, query_vt, query_tt, answer, traps in windows:
+        for category, query_vt, query_tt, answer, valid_from, traps in windows:
             cases.append(
                 EvalCase(
                     case_id=f"{group_id}_{category}",
@@ -401,6 +403,7 @@ def load_bitemporal_evaluation_cases(
                     query_vt=query_vt,
                     query_tt=query_tt,
                     anachronistic_traps=traps,
+                    expected_valid_from=valid_from,
                 )
             )
     return cases

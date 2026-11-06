@@ -23,10 +23,12 @@ import os
 import re
 import shutil
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from openai import AsyncOpenAI
 from tqdm.auto import tqdm
 
 from src.config import ExperimentConfig
@@ -43,6 +45,28 @@ from src.inference_setup import LLMGenerationError, LocalInferenceEngine
 # Tantos grupos seguidos fallando indican un problema general, no casos difíciles:
 # seguir solo gastaría cómputo.
 MAX_CONSECUTIVE_FAILED_GROUPS = 10
+# El valor por defecto de `OpenAIGenericClient`: con 4096 se cortaban extracciones legítimas
+GRAPHITI_MAX_TOKENS = 16384
+
+
+class _NoRetryOnTruncation:
+    """
+    Cuando Qwen entra en un bucle de repetición, el JSON queda cortado y Graphiti lo reintenta
+    hasta 4 veces, pero con temperatura 0 cada intento repite el mismo bucle: en el piloto
+    ningún reintento salvó un caso. Una salida cortada se reporta como error del caso sin
+    reintentar, así que el resultado es el mismo con un cuarto del cómputo.
+    """
+
+    def __init__(self, client: AsyncOpenAI) -> None:
+        self._client = client
+
+    async def create(self, **kwargs: Any) -> Any:
+        response = await self._client.chat.completions.create(**kwargs)
+        if response.choices and response.choices[0].finish_reason == "length":
+            raise LLMGenerationError(
+                f"Salida de Graphiti cortada en {kwargs.get('max_tokens')} tokens"
+            )
+        return response
 
 
 # =============================================================================
@@ -56,6 +80,11 @@ def _as_utc(moment: Optional[datetime]) -> Optional[datetime]:
     if moment.tzinfo is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc)
+
+
+def _iso_or_none(moment: Optional[datetime]) -> Optional[str]:
+    value = _as_utc(moment)
+    return value.isoformat() if value else None
 
 
 def known_invalid_at(edge: Any, tt_clock: datetime) -> Optional[datetime]:
@@ -99,13 +128,16 @@ class GraphitiMemory:
     en que terminó cada episodio para traducir un TT simulado a ese reloj.
     """
 
+    # Varios grupos abren Graphiti a la vez y crean los mismos índices de Neo4j
+    _index_lock = asyncio.Lock()
+
     def __init__(self, config: ExperimentConfig, engine: LocalInferenceEngine) -> None:
         self.config = config
         self.engine = engine
         self.graphiti: Any = None
         self.group_id: str = ""
         self.tt_clock: List[Tuple[datetime, datetime]] = []
-        self.graph_facts: List[str] = []
+        self.graph_edges: List[Dict[str, Any]] = []
 
     async def open(self, group_id: str) -> None:
         os.environ.setdefault("GRAPHITI_TELEMETRY_ENABLED", "false")
@@ -142,14 +174,23 @@ class GraphitiMemory:
                     small_model=self.config.llm_model_id,
                     base_url=self.config.base_url,
                     temperature=0.0,
-                    max_tokens=4096,
-                )
+                    max_tokens=GRAPHITI_MAX_TOKENS,
+                ),
+                client=SimpleNamespace(
+                    chat=SimpleNamespace(
+                        completions=_NoRetryOnTruncation(
+                            AsyncOpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
+                        )
+                    )
+                ),
+                max_tokens=GRAPHITI_MAX_TOKENS,
             ),
             embedder=LocalEmbedder(),
             cross_encoder=NoOpReranker(),
             max_coroutines=min(32, self.config.max_num_seqs),
         )
-        await self.graphiti.build_indices_and_constraints()
+        async with GraphitiMemory._index_lock:
+            await self.graphiti.build_indices_and_constraints()
         # Una corrida interrumpida pudo dejar datos de este mismo escenario
         self.group_id = re.sub(r"[^a-zA-Z0-9_-]", "_", group_id)
         await clear_data(self.graphiti.driver, group_ids=[self.group_id])
@@ -172,7 +213,15 @@ class GraphitiMemory:
         from graphiti_core.edges import EntityEdge
 
         edges = await EntityEdge.get_by_group_ids(self.graphiti.driver, [self.group_id])
-        self.graph_facts = [edge.fact for edge in edges]
+        self.graph_edges = [
+            {
+                "fact": edge.fact,
+                "valid_at": _iso_or_none(edge.valid_at),
+                "invalid_at": _iso_or_none(edge.invalid_at),
+                "expired_at": _iso_or_none(edge.expired_at),
+            }
+            for edge in edges
+        ]
 
     def _clock_for(self, query_tt: datetime) -> Optional[datetime]:
         """Instante real en que el sistema tenía registrado lo ingerido hasta `query_tt`."""
@@ -231,7 +280,7 @@ class LightRAGMemory:
         self.engine = engine
         self.rag: Any = None
         self.work_dir: Any = None
-        self.graph_facts: List[str] = []
+        self.graph_edges: List[Dict[str, Any]] = []
 
     async def open(self, group_id: str) -> None:
         self.work_dir = self.config.base_dir / f"workdir_exp2_{group_id}"
@@ -289,24 +338,47 @@ def _base_row(case: EvalCase, metodo: str) -> Dict[str, Any]:
     }
 
 
+def _has_non_latin_letters(text: str) -> bool:
+    """Detecta hechos en otro alfabeto: los episodios de los casos están en inglés."""
+    return any(char.isalpha() and ord(char) > 0x24F for char in text)
+
+
 def _diagnose(
-    case: EvalCase, metodo: str, graph_facts: List[str], facts: List[str]
+    case: EvalCase, metodo: str, graph_edges: List[Dict[str, Any]], facts: List[str]
 ) -> Dict[str, Any]:
     """
-    En los escenarios sintéticos, indica en qué etapa estaba o se perdió el valor correcto,
-    para separar errores de extracción, de recuperación y de respuesta.
+    Registra en qué etapa estaba o se perdió el valor correcto, para separar errores de
+    extracción, de fecha, de recuperación y de respuesta. Solo mide: no cambia la evaluación.
     LightRAG y LongMemEval no tienen valores comparables de esta forma.
     """
-    if case.source != "sintetico" or metodo == LIGHTRAG_LABEL:
+    if metodo == LIGHTRAG_LABEL:
         return {}
+    graph_facts = [edge["fact"] for edge in graph_edges]
+    language = {
+        "proporcion_hechos_no_latinos": (
+            sum(map(_has_non_latin_letters, graph_facts)) / len(graph_facts)
+            if graph_facts
+            else None
+        )
+    }
+    if case.source != "sintetico":
+        return language
 
     def _mentions(value: str, texts: List[str]) -> bool:
         return any(value.lower() in text.lower() for text in texts)
 
+    expected_day = case.expected_valid_from.date().isoformat()
     return {
+        **language,
         "oro_en_grafo": _mentions(case.ground_truth, graph_facts),
         "oro_en_hechos": _mentions(case.ground_truth, facts),
         "trampa_en_hechos": any(_mentions(trap, facts) for trap in case.anachronistic_traps),
+        "fecha_oro_correcta": any(
+            _mentions(case.ground_truth, [edge["fact"]])
+            and (edge["valid_at"] or "").startswith(expected_day)
+            for edge in graph_edges
+        ),
+        "aristas_grafo": json.dumps(graph_edges, ensure_ascii=False),
     }
 
 
@@ -332,7 +404,7 @@ async def _evaluate_group(
                     "estado": "ok",
                     "respuesta_generada": answer,
                     "hechos_usados": json.dumps(facts, ensure_ascii=False),
-                    **_diagnose(case, metodo, system.graph_facts, facts),
+                    **_diagnose(case, metodo, system.graph_edges, facts),
                     "correcto": verdict["correct"],
                     "error_anacronico": verdict["anachronistic"],
                     "juez_fuente": verdict["source"],
@@ -383,13 +455,17 @@ async def run_experiment_2(
     for case in cases:
         groups.setdefault(case.group_id, []).append(case)
 
-    # Las dos configuraciones de Graphiti reutilizan el mismo índice
+    # Las dos configuraciones de Graphiti reutilizan el mismo índice. Graphiti ingiere los
+    # episodios de un grupo en serie y deja la GPU casi ociosa, así que varios grupos se
+    # procesan a la vez. LightRAG va de a uno: detecta sus fallos con un contador global del
+    # motor, que se mezclaría entre grupos simultáneos.
     systems = (
         (
-            GraphitiMemory(cfg, inf_engine),
+            lambda: GraphitiMemory(cfg, inf_engine),
             ((ZEP_ASOF_LABEL, True), (ZEP_RAW_LABEL, False)),
+            True,
         ),
-        (LightRAGMemory(cfg, inf_engine), ((LIGHTRAG_LABEL, False),)),
+        (lambda: LightRAGMemory(cfg, inf_engine), ((LIGHTRAG_LABEL, False),), False),
     )
     judge = AnswerJudge(inf_engine)
 
@@ -402,30 +478,48 @@ async def run_experiment_2(
     csv_out_path = cfg.base_dir / cfg.exp2_csv_path
 
     consecutive_failures = [0 for _ in systems]
-    for group_cases in tqdm(groups.values(), desc="Experimento 2 (grupos de casos)"):
-        for system_idx, (system, arms) in enumerate(systems):
-            pending = [
-                (metodo, as_of, case)
-                for case in group_cases
-                for metodo, as_of in arms
-                if (metodo, case.case_id) not in done
+    group_list = list(groups.values())
+    batch_size = max(1, cfg.exp2_parallel_groups)
+    progress = tqdm(total=len(group_list), desc="Experimento 2 (grupos de casos)")
+    for start in range(0, len(group_list), batch_size):
+        batch = group_list[start : start + batch_size]
+        for system_idx, (make_system, arms, parallel) in enumerate(systems):
+            pendings = [
+                [
+                    (metodo, as_of, case)
+                    for case in group_cases
+                    for metodo, as_of in arms
+                    if (metodo, case.case_id) not in done
+                ]
+                for group_cases in batch
             ]
-            if not pending:
-                continue
-            group_rows = await _evaluate_group(system, arms, judge, pending)
-            detailed_rows.extend(group_rows)
-            failed = all(row["estado"] == "error" for row in group_rows)
-            consecutive_failures[system_idx] = consecutive_failures[system_idx] + 1 if failed else 0
+            calls = [
+                _evaluate_group(make_system(), arms, judge, pending)
+                for pending in pendings
+                if pending
+            ]
+            if parallel:
+                results = await asyncio.gather(*calls)
+            else:
+                results = [await call for call in calls]
+            for group_rows in results:
+                detailed_rows.extend(group_rows)
+                failed = all(row["estado"] == "error" for row in group_rows)
+                consecutive_failures[system_idx] = (
+                    consecutive_failures[system_idx] + 1 if failed else 0
+                )
 
-        # Guardado incremental por grupo para tolerancia a fallos en Colab
+        # Guardado incremental por lote para tolerancia a fallos en Colab
         pd.DataFrame(detailed_rows).to_csv(csv_out_path, index=False, encoding="utf-8")
         cfg.sync_to_google_drive(csv_out_path)
+        progress.update(len(batch))
 
         if max(consecutive_failures) >= MAX_CONSECUTIVE_FAILED_GROUPS:
             raise RuntimeError(
                 f"Un sistema falló en {max(consecutive_failures)} grupos seguidos. "
                 f"Último error: {detailed_rows[-1]['juez_rationale']}"
             )
+    progress.close()
 
     df_detailed = pd.DataFrame(detailed_rows)
     df_valid = df_detailed[df_detailed["juez_fuente"] == "llm"].copy()

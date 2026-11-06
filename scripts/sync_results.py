@@ -9,6 +9,7 @@ Uso:
 """
 
 import argparse
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,12 @@ REMOTE_DIRS = [
     "/content/pfc1",
     "/content/drive/MyDrive/PFC_RAG_Resultados",
 ]
+# Carpeta de la app Google Drive para escritorio ("Mi unidad" o "My Drive" según el idioma)
+LOCAL_DRIVE_GLOB = "Library/CloudStorage/GoogleDrive-*/*/PFC_RAG_Resultados"
+
+
+def local_drive_dirs() -> list:
+    return sorted(Path.home().glob(LOCAL_DRIVE_GLOB))
 
 
 def sync_from_colab(session: str = "pfc", remote_base: str = "/content/pfc1") -> None:
@@ -49,7 +56,7 @@ def sync_from_colab(session: str = "pfc", remote_base: str = "/content/pfc1") ->
             remote_path = f"{r_dir}/{filename}"
             cmd = ["colab", "download", "-s", session, remote_path, str(local_path)]
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                 if res.returncode == 0 and local_path.exists() and local_path.stat().st_size > 0:
                     size_kb = local_path.stat().st_size / 1024
                     print(f" [OK] {filename} descargado en tu laptop ({size_kb:.1f} KB)")
@@ -58,6 +65,16 @@ def sync_from_colab(session: str = "pfc", remote_base: str = "/content/pfc1") ->
             except Exception as exc:
                 print(f" [ERROR] Fallo al invocar colab download para {filename}: {exc}")
                 break
+
+        # Si la VM ya no responde, la copia que Google Drive sincronizó en este Mac
+        if not downloaded:
+            for drive_dir in local_drive_dirs():
+                drive_copy = drive_dir / filename
+                if drive_copy.exists() and drive_copy.stat().st_size > 0:
+                    shutil.copy2(drive_copy, local_path)
+                    print(f" [OK] {filename} copiado desde Google Drive en tu Mac: {drive_dir}")
+                    downloaded = True
+                    break
 
         if not downloaded:
             print(f" [PENDIENTE] {filename} (aún no generado en la VM)")

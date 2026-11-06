@@ -33,6 +33,8 @@ REPO_DIR = "/content/pfc1"
 DRIVE_DIR = "/content/drive/MyDrive/PFC_RAG_Resultados"
 POLL_SECONDS = 30
 EXEC_TIMEOUT_SECONDS = 90
+MAX_UNRESPONSIVE_POLLS = 5
+AUTH_PROMPT = "To authorize colab-cli"
 NEO4J_VERSION = "5.26.21"
 NEO4J_HOME = f"/content/neo4j-community-{NEO4J_VERSION}"
 NEO4J_JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
@@ -41,7 +43,7 @@ NEO4J_PASSWORD = "pfc-local-neo4j"
 REPORT_EVERY_SECONDS = 120
 
 PACKAGES = [
-    "lightrag-hku==1.5.7", "spacy", "vllm", "graphiti-core==0.31.2", "datasets", "pandas",
+    "lightrag-hku==1.5.7", "spacy", "vllm==0.33.0", "graphiti-core==0.31.2", "datasets", "pandas",
     "networkx", "sentence-transformers", "FlagEmbedding", "tiktoken", "openai",
     "matplotlib", "seaborn", "tqdm", "nest_asyncio", "psutil",
 ]
@@ -121,6 +123,7 @@ def start_on_colab_vm() -> None:
     # El piloto siempre empieza de cero, pero solo borra sus propios archivos
     pilot = os.environ.get("PFC_PILOT") == "1"
     mode_fresh = os.environ.get("PFC_FRESH") == "1" or pilot
+    skip_exp1 = os.environ.get("PFC_SKIP_EXP1") == "1"
 
     pid = running_pid()
     if pid and mode_fresh:
@@ -148,6 +151,8 @@ def start_on_colab_vm() -> None:
                 "muestra_revision_juez.csv",
                 "run_manifest.json",
             ):
+                if skip_exp1 and old_output.startswith("experimento1_"):
+                    continue
                 for folder in (DRIVE_DIR, REPO_DIR):
                     p = os.path.join(folder, f"piloto_{old_output}" if pilot else old_output)
                     if os.path.exists(p):
@@ -195,21 +200,19 @@ def start_on_colab_vm() -> None:
 REMOTE_POLL_SNIPPET = """
 import os, shutil, subprocess
 out = subprocess.run(["pgrep", "-f", "run_all_experiments.py"], capture_output=True, text=True).stdout.split()
-log_p = "/content/drive/MyDrive/PFC_RAG_Resultados/experiments.log"
-if not os.path.exists(log_p):
-    log_p = "/content/pfc1/experiments.log"
-lines = ""
-if os.path.exists(log_p):
-    with open(log_p, "r", encoding="utf-8", errors="replace") as f:
-        lines = "".join(f.readlines()[-6:]).rstrip()
-if out:
-    print("STATUS:RUNNING:" + out[0])
-    print(lines)
-else:
-    if os.path.exists(log_p) and log_p != "/content/pfc1/experiments.log":
-        shutil.copy2(log_p, "/content/pfc1/experiments.log")
-    print("STATUS:DONE")
-    print(lines)
+# El estado va antes que el log: si leer Drive falla, la VM igual cuenta como activa
+print("STATUS:RUNNING:" + out[0] if out else "STATUS:DONE")
+try:
+    log_p = "/content/drive/MyDrive/PFC_RAG_Resultados/experiments.log"
+    if not os.path.exists(log_p):
+        log_p = "/content/pfc1/experiments.log"
+    if os.path.exists(log_p):
+        if not out and log_p != "/content/pfc1/experiments.log":
+            shutil.copy2(log_p, "/content/pfc1/experiments.log")
+        with open(log_p, "r", encoding="utf-8", errors="replace") as f:
+            print("".join(f.readlines()[-6:]).rstrip())
+except OSError as exc:
+    print(f"(no se pudo leer el log: {exc})")
 """
 
 
@@ -293,7 +296,14 @@ def run_from_mac_laptop() -> None:
         action="store_true",
         help="Elimina todos los checkpoints previos y recalcula los dos experimentos desde cero.",
     )
+    parser.add_argument(
+        "--skip-exp1",
+        action="store_true",
+        help="Solo con --pilot: reutiliza el Experimento 1 del piloto anterior guardado en Drive.",
+    )
     args = parser.parse_args()
+    if args.skip_exp1 and not args.pilot:
+        parser.error("--skip-exp1 solo se permite con --pilot")
 
     script_path = Path(__file__).resolve()
     repo_root = script_path.parent.parent
@@ -321,6 +331,7 @@ def run_from_mac_laptop() -> None:
             "os.environ['PFC_MAC_MANAGED'] = '1'\n"
             f"os.environ['PFC_FRESH'] = '{'1' if args.fresh else '0'}'\n"
             f"os.environ['PFC_PILOT'] = '{'1' if args.pilot else '0'}'\n"
+            f"os.environ['PFC_SKIP_EXP1'] = '{'1' if args.skip_exp1 else '0'}'\n"
         )
         full_code = header + script_path.read_text(encoding="utf-8")
 
@@ -340,10 +351,24 @@ def run_from_mac_laptop() -> None:
         # Bucle de monitoreo mediante llamadas cortas (mantiene viva la VM sin TimeoutError)
         t0 = time.time()
         last_report = 0.0
+        unresponsive_polls = 0
         while True:
             time.sleep(POLL_SECONDS)
             res = colab_exec_short(args.session, REMOTE_POLL_SNIPPET, repo_root)
             out_text = (res.stdout or "").strip()
+            # Sin autorización ninguna consulta va a responder, aunque la VM siga trabajando
+            if AUTH_PROMPT in out_text + (res.stderr or ""):
+                raise RuntimeError(
+                    "Colab CLI pide autorizar de nuevo. El pipeline sigue en la VM y guarda en "
+                    "Drive: autoriza con `colab sessions` y descarga con scripts/sync_results.py."
+                )
+            # Sin este límite, una VM perdida dejaría al Mac esperando para siempre
+            unresponsive_polls = 0 if "STATUS:" in out_text else unresponsive_polls + 1
+            if unresponsive_polls:
+                detail = ((res.stderr or "") + out_text).strip()[-300:]
+                print(f"[AVISO] Consulta sin estado ({unresponsive_polls}/{MAX_UNRESPONSIVE_POLLS}): {detail}", flush=True)
+            if unresponsive_polls >= MAX_UNRESPONSIVE_POLLS:
+                raise RuntimeError(f"La VM no responde tras {unresponsive_polls} consultas seguidas.")
             if "STATUS:DONE" in out_text:
                 tail_text = out_text.split("STATUS:DONE", 1)[-1].strip()
                 print(f"\n[FIN] El pipeline terminó en la VM. Últimas líneas del log:\n{tail_text}", flush=True)
