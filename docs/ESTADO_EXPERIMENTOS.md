@@ -21,6 +21,24 @@ Actualizado: 2026-11-06. Sirve para retomar el trabajo en una conversación nuev
 - **Errores del cierre:** el pipeline falló al generar las figuras (`yerr` negativo por redondeo en Wilson), así que el manifiesto quedó `en_curso`. En el Mac, el lanzador se detuvo porque Colab pidió reautorizar la CLI.
 - **Accuracy del piloto:** solo sirve para depurar, no para ajustar el diseño. En los escenarios sintéticos: Graphiti 0.50, capa as-of 0.43, LightRAG 0.60. En LongMemEval, sobre los casos evaluados: 0.14, 0.14 y 0.40.
 
+## Corrida final, tramo 1 (2026-11-06, 15:41 a 21:35, unas 51 unidades)
+
+- **Código:** `v1-final` (commit `fde4b54`). Se lanzó con `--fresh` en una A100 High-RAM.
+- **Experimento 1:** 22 de 24 filas, sin llamadas fallidas.
+  - Hechas las corridas 1 y 2 completas, y la corrida 3 en 100k, 250k y 500k.
+  - Falta la corrida 3 en 1M.
+- **Corte:** la VM se apagó a propósito tras el checkpoint 22, para no cortar LightRAG en 1M a mitad. El manifiesto queda `en_curso`.
+- **Respaldo:** `final_tramo1_20261106/`, con el CSV, el manifiesto y el log.
+- **Latencia (s/MB):** estable entre corridas.
+  - LightRAG: de 862 a 1068.
+  - E²GraphRAG: de 62 a 86.
+- **Declarar en el paper:** la corrida 3 en 1M y el Experimento 2 se ejecutan en otra VM A100 (tramo 2).
+
+**Tramo 2 (desde el 2026-11-13):** `colab new` + `colab drivemount` desde la terminal del autor, porque Drive pide autorización interactiva. Después `python3 scripts/colab_launch.py -s pfc` **sin `--fresh`**.
+- **Qué falta:** LightRAG y E²GraphRAG en 1M (~1h20), la calidad en 1M y el Experimento 2 (~8 h).
+- **Costo:** unas 90 unidades.
+- **Margen:** el saldo será de 264.83 y su mitad es ~132.
+
 ## Piloto de verificación del 2026-11-06 (solo Experimento 2, 6.78 unidades)
 
 - **Resultado:** lanzador con código 0, manifiesto `completado`, análisis y las dos figuras generadas. El Experimento 2 tardó 25.8 minutos y el pipeline completo 30.2.

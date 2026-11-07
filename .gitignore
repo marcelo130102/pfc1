@@ -36,3 +36,4 @@ smoke_test.log
 # Resultados temporales (conservar CSVs y figuras finales si se desea versionar)
 .ipynb_checkpoints/
 .DS_Store
+/final_tramo*
