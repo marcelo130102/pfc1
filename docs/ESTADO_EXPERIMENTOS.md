@@ -21,6 +21,37 @@ Actualizado: 2026-11-06. Sirve para retomar el trabajo en una conversación nuev
 - **Errores del cierre:** el pipeline falló al generar las figuras (`yerr` negativo por redondeo en Wilson), así que el manifiesto quedó `en_curso`. En el Mac, el lanzador se detuvo porque Colab pidió reautorizar la CLI.
 - **Accuracy del piloto:** solo sirve para depurar, no para ajustar el diseño. En los escenarios sintéticos: Graphiti 0.50, capa as-of 0.43, LightRAG 0.60. En LongMemEval, sobre los casos evaluados: 0.14, 0.14 y 0.40.
 
+## Corrida final, tramo 3 (2026-11-08, 19:35 a 21:24, unas 16 unidades)
+
+- **Alcance:** se lanzó antes de la renovación, con el saldo en 33.99. Para no gastar más de la mitad, la guardia apagó la VM tras el checkpoint con el saldo en 17.74. Se reanudó sin `--fresh`, en otra VM A100 High-RAM.
+- **LongMemEval:** 46 de 191 casos (36 nuevos).
+  - LightRAG: 46 de 46 evaluados, sin errores.
+  - Graphiti: 13 de 46 casos (28%) cortados en 16384 tokens, cada uno en sus dos brazos. Todos los errores son de ese tipo.
+  - Al reintentar, `2c63a862` salió bien y `gpt4_2312f94c` y `gpt4_5dcc0aab` volvieron a cortarse. Con temperatura 0 el corte no es del todo determinista, probablemente por el procesamiento en lotes de vLLM. Declararlo.
+- **Neo4j:** un aviso aislado de conexión que se resolvió al reintentar, sin caídas.
+- **Ritmo:** ~4 min por caso al arrancar y ~2.5 en régimen.
+- **Respaldo:** `final_tramo3_20261108/`.
+- **Tramo 4 (desde el 2026-11-13):**
+  - Faltan 145 casos de LongMemEval, entre 6 y 9 horas y entre 55 y 80 unidades. El saldo será de 217.74 y su mitad, ~109.
+  - Mismo procedimiento: `colab new` y `drivemount` desde la terminal del autor, y después `colab_launch.py -s pfc` sin `--fresh`.
+
+## Corrida final, tramo 2 (2026-11-08, 13:59 a 17:22, unas 31 unidades)
+
+- **Código:** sigue en `v1-final`; el commit `99e8d79` solo toca la documentación. La corrida se reanudó sin `--fresh` y recuperó las 22 filas sin duplicar ninguna.
+- **Experimento 1 completo:** 24 de 24 filas, todas con 0 llamadas fallidas.
+  - En la corrida 3, LightRAG en 1M dio 939 s/MB y E²GraphRAG 63.
+- **Calidad en 1M:** 50 preguntas por sistema, todas con veredicto.
+  - Accuracy: LightRAG 0.24, E²GraphRAG 0.02.
+  - E²GraphRAG responde con fluidez pero sobre otro tema, así que el fallo parece de recuperación. Merece una sección del análisis de errores.
+- **Experimento 2:** 480 filas.
+  - Los 30 escenarios sintéticos están completos (450 filas, todas `ok`).
+  - De LongMemEval van 10 casos. Graphiti cortó 3 en 16384 tokens (`gpt4_2312f94c`, `2c63a862` y `gpt4_5dcc0aab`).
+- **Corte:** la guardia apagó la VM tras un checkpoint, con el saldo en 34.71. Respaldo en `final_tramo2_20261108/`.
+- **Tramo 3 (desde el 2026-11-13):**
+  - Faltan 181 casos de LongMemEval, unas 7.5 horas y ~68 unidades. El saldo será de 233.99 y su mitad, ~117.
+  - Mismo procedimiento: `colab new` y `drivemount` desde la terminal del autor, y después `colab_launch.py -s pfc` sin `--fresh`.
+  - Al reanudar, los 3 casos con error se reintentan una vez, como estaba previsto. Con temperatura 0, deberían volver a cortarse.
+
 ## Corrida final, tramo 1 (2026-11-06, 15:41 a 21:35, unas 51 unidades)
 
 - **Código:** `v1-final` (commit `fde4b54`). Se lanzó con `--fresh` en una A100 High-RAM.
