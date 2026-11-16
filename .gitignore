@@ -37,3 +37,4 @@ smoke_test.log
 .ipynb_checkpoints/
 .DS_Store
 /final_tramo*
+/scripts/local/
